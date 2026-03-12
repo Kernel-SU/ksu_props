@@ -17,3 +17,9 @@ path = "src/bin/write_props.rs"
 [[bin]]
 name = "gen_sample_props"
 path = "src/bin/gen_sample_props.rs"
+[[bin]]
+name = "sysprop"
+path = "src/bin/sysprop.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
