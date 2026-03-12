@@ -5,9 +5,9 @@ use std::mem::offset_of;
 
 use crate::prop_info::{
     align_up, PropertyInfo, RawLongProperty, RawPropAreaHeader, RawPropInfoHeader,
-    RawTrieNodeHeader, INITIAL_BYTES_USED, LONG_LEGACY_ERROR, LONG_OFFSET_IN_INFO,
-    PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC, PROP_AREA_VERSION, PROP_INFO_LONG_FLAG, PROP_INFO_SIZE,
-    PROP_TRIE_NODE_HEADER_SIZE, PROP_VALUE_MAX,
+    RawTrieNodeHeader, DIRTY_BACKUP_SIZE, INITIAL_BYTES_USED, LONG_LEGACY_ERROR,
+    LONG_OFFSET_IN_INFO, PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC, PROP_AREA_VERSION,
+    PROP_INFO_LONG_FLAG, PROP_INFO_SIZE, PROP_TRIE_NODE_HEADER_SIZE, PROP_VALUE_MAX,
 };
 
 // ── Offset constants derived entirely from the repr(C) structs ────────────────
@@ -129,6 +129,41 @@ pub struct PropArea<M> {
     data_size: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PropAreaObjectKind {
+    TrieNode,
+    DirtyBackup,
+    PropInfo,
+    LongValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropAreaObjectInfo {
+    pub kind:               PropAreaObjectKind,
+    pub offset:             u32,
+    pub size:               u32,
+    pub aligned_size:       u32,
+    pub end_offset:         u32,
+    pub aligned_end_offset: u32,
+    pub detail:             String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropAreaHoleInfo {
+    pub start_offset: u32,
+    pub end_offset:   u32,
+    pub size:         u32,
+    pub aligned_size: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropAreaAllocationScan {
+    pub bytes_used:       u32,
+    pub has_dirty_backup: bool,
+    pub objects:          Vec<PropAreaObjectInfo>,
+    pub holes:            Vec<PropAreaHoleInfo>,
+}
+
 impl<M: Read + Seek> PropArea<M> {
     pub fn new(inner: M) -> Result<Self> {
         let mut inner = inner;
@@ -182,6 +217,92 @@ impl<M: Read + Seek> PropArea<M> {
         F: FnMut(PropertyInfo),
     {
         self.for_each_property(callback)
+    }
+
+    pub fn scan_allocations(&mut self) -> Result<PropAreaAllocationScan> {
+        let bytes_used = self.bytes_used()?;
+        let has_dirty_backup = self.has_dirty_backup()?;
+
+        let mut objects = Vec::new();
+        let mut stack = BTreeSet::new();
+        let mut seen_nodes = BTreeSet::new();
+        let mut seen_props = BTreeSet::new();
+        let mut seen_longs = BTreeSet::new();
+
+        if has_dirty_backup {
+            objects.push(Self::make_scan_object(
+                PropAreaObjectKind::DirtyBackup,
+                PROP_TRIE_NODE_HEADER_SIZE,
+                DIRTY_BACKUP_SIZE,
+                "<dirty-backup>".to_owned(),
+            )?);
+        }
+
+        self.scan_allocations_from(
+            0,
+            &mut stack,
+            &mut seen_nodes,
+            &mut seen_props,
+            &mut seen_longs,
+            &mut objects,
+        )?;
+
+        objects.sort_by(|a, b| {
+            a.offset
+                .cmp(&b.offset)
+                .then(a.kind.cmp(&b.kind))
+                .then(a.aligned_end_offset.cmp(&b.aligned_end_offset))
+        });
+
+        for object in &objects {
+            if object.aligned_end_offset > bytes_used {
+                return Err(PropAreaError::Corrupted(
+                    "allocation object extends beyond bytes_used",
+                ));
+            }
+        }
+
+        let mut holes = Vec::new();
+        let initial_cursor = if has_dirty_backup {
+            INITIAL_BYTES_USED
+        } else {
+            PROP_TRIE_NODE_HEADER_SIZE
+        };
+        let mut cursor = initial_cursor.min(bytes_used);
+
+        for object in &objects {
+            if object.offset > cursor {
+                holes.push(Self::make_scan_hole(cursor, object.offset));
+            }
+            if object.aligned_end_offset > cursor {
+                cursor = object.aligned_end_offset;
+            }
+        }
+
+        if bytes_used > cursor {
+            holes.push(Self::make_scan_hole(cursor, bytes_used));
+        }
+
+        Ok(PropAreaAllocationScan {
+            bytes_used,
+            has_dirty_backup,
+            objects,
+            holes,
+        })
+    }
+
+    fn has_dirty_backup(&mut self) -> Result<bool> {
+        let root = self.read_node(0)?;
+
+        if root.children != 0 && root.children == PROP_TRIE_NODE_HEADER_SIZE {
+            return Ok(false);
+        }
+
+        if root.children == 0 {
+            return Ok(self.bytes_used()? == INITIAL_BYTES_USED);
+        }
+
+        Ok(true)
     }
 
     fn from_inner_with_size(inner: M, area_size: u64) -> Result<Self> {
@@ -385,6 +506,155 @@ impl<M: Read + Seek> PropArea<M> {
 
         visited.remove(&offset);
         Ok(())
+    }
+
+    fn scan_allocations_from(
+        &mut self,
+        offset: u32,
+        stack: &mut BTreeSet<u32>,
+        seen_nodes: &mut BTreeSet<u32>,
+        seen_props: &mut BTreeSet<u32>,
+        seen_longs: &mut BTreeSet<u32>,
+        objects: &mut Vec<PropAreaObjectInfo>,
+    ) -> Result<()> {
+        if seen_nodes.contains(&offset) {
+            return Ok(());
+        }
+
+        if !stack.insert(offset) {
+            return Err(PropAreaError::Corrupted(
+                "cycle detected while scanning allocation trie",
+            ));
+        }
+
+        let node = self.read_node(offset)?;
+        seen_nodes.insert(offset);
+
+        let trie_size = if node.namelen == 0 {
+            PROP_TRIE_NODE_HEADER_SIZE
+        } else {
+            PROP_TRIE_NODE_HEADER_SIZE
+                .checked_add(node.namelen)
+                .and_then(|v| v.checked_add(1))
+                .ok_or(PropAreaError::InvalidOffset(node.offset))?
+        };
+
+        let trie_detail = if node.namelen == 0 {
+            "<root>".to_owned()
+        } else {
+            node.name.clone()
+        };
+
+        objects.push(Self::make_scan_object(
+            PropAreaObjectKind::TrieNode,
+            node.offset,
+            trie_size,
+            trie_detail,
+        )?);
+
+        if node.prop != 0 && seen_props.insert(node.prop) {
+            let record = self.read_prop_record(node.prop)?;
+
+            let name_len = u32::try_from(record.name.len())
+                .map_err(|_| PropAreaError::Corrupted("property name too long"))?;
+            let prop_size = PROP_INFO_SIZE
+                .checked_add(name_len)
+                .and_then(|v| v.checked_add(1))
+                .ok_or(PropAreaError::InvalidOffset(record.prop_offset))?;
+
+            objects.push(Self::make_scan_object(
+                PropAreaObjectKind::PropInfo,
+                record.prop_offset,
+                prop_size,
+                record.name.clone(),
+            )?);
+
+            if record.is_long && seen_longs.insert(record.value_offset) {
+                let value_len = u32::try_from(record.value.len())
+                    .map_err(|_| PropAreaError::Corrupted("long value too long"))?;
+                let long_size = value_len
+                    .checked_add(1)
+                    .ok_or(PropAreaError::InvalidOffset(record.value_offset))?;
+
+                objects.push(Self::make_scan_object(
+                    PropAreaObjectKind::LongValue,
+                    record.value_offset,
+                    long_size,
+                    record.name,
+                )?);
+            }
+        }
+
+        if node.left != 0 {
+            self.scan_allocations_from(
+                node.left,
+                stack,
+                seen_nodes,
+                seen_props,
+                seen_longs,
+                objects,
+            )?;
+        }
+
+        if node.children != 0 {
+            self.scan_allocations_from(
+                node.children,
+                stack,
+                seen_nodes,
+                seen_props,
+                seen_longs,
+                objects,
+            )?;
+        }
+
+        if node.right != 0 {
+            self.scan_allocations_from(
+                node.right,
+                stack,
+                seen_nodes,
+                seen_props,
+                seen_longs,
+                objects,
+            )?;
+        }
+
+        stack.remove(&offset);
+        Ok(())
+    }
+
+    fn make_scan_object(
+        kind: PropAreaObjectKind,
+        offset: u32,
+        size: u32,
+        detail: String,
+    ) -> Result<PropAreaObjectInfo> {
+        let aligned_size = align_up(size, 4);
+        let end_offset = offset
+            .checked_add(size)
+            .ok_or(PropAreaError::InvalidOffset(offset))?;
+        let aligned_end_offset = offset
+            .checked_add(aligned_size)
+            .ok_or(PropAreaError::InvalidOffset(offset))?;
+
+        Ok(PropAreaObjectInfo {
+            kind,
+            offset,
+            size,
+            aligned_size,
+            end_offset,
+            aligned_end_offset,
+            detail,
+        })
+    }
+
+    fn make_scan_hole(start_offset: u32, end_offset: u32) -> PropAreaHoleInfo {
+        let size = end_offset.saturating_sub(start_offset);
+        PropAreaHoleInfo {
+            start_offset,
+            end_offset,
+            size,
+            aligned_size: align_up(size, 4),
+        }
     }
 
     fn to_property_info(&self, record: PropRecord) -> PropertyInfo {

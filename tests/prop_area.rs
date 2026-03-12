@@ -1,6 +1,9 @@
 use std::io::Cursor;
 
-use resetprop_rs::{PropArea, PropAreaError, PROP_AREA_HEADER_SIZE, PROP_VALUE_MAX};
+use resetprop_rs::{
+    PropArea, PropAreaError, PropAreaObjectKind, PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC,
+    PROP_AREA_VERSION, PROP_VALUE_MAX,
+};
 
 fn new_area(size: usize) -> PropArea<Cursor<Vec<u8>>> {
     PropArea::create(Cursor::new(vec![0; size]), size as u64).unwrap()
@@ -13,6 +16,10 @@ fn data_abs(offset: u32) -> usize {
 fn read_serial(raw: &[u8], prop_offset: u32) -> u32 {
     let abs = data_abs(prop_offset);
     u32::from_le_bytes(raw[abs..abs + 4].try_into().unwrap())
+}
+
+fn write_u32(raw: &mut [u8], abs: usize, value: u32) {
+    raw[abs..abs + 4].copy_from_slice(&value.to_le_bytes());
 }
 
 #[test]
@@ -191,4 +198,90 @@ fn update_inline_rejects_conversion_to_long() {
     assert_eq!(after.value, old_value);
     assert!(!after.is_long);
     assert_eq!(after.prop_offset, before.prop_offset);
+}
+
+#[test]
+fn scan_allocations_reports_objects_sorted_and_typed() {
+    let mut area = new_area(16384);
+    area.set_property("ro.scan.inline", "abc").unwrap();
+    area.set_property("persist.scan.long", &"x".repeat(120)).unwrap();
+
+    let scan = area.scan_allocations().unwrap();
+    assert!(scan.has_dirty_backup);
+    assert!(!scan.objects.is_empty());
+    assert!(scan
+        .objects
+        .windows(2)
+        .all(|pair| pair[0].offset <= pair[1].offset));
+
+    assert!(scan
+        .objects
+        .iter()
+        .any(|obj| obj.kind == PropAreaObjectKind::DirtyBackup));
+    assert!(scan
+        .objects
+        .iter()
+        .any(|obj| obj.kind == PropAreaObjectKind::TrieNode));
+    assert!(scan
+        .objects
+        .iter()
+        .any(|obj| obj.kind == PropAreaObjectKind::PropInfo));
+    assert!(scan
+        .objects
+        .iter()
+        .any(|obj| obj.kind == PropAreaObjectKind::LongValue));
+}
+
+#[test]
+fn scan_allocations_reports_hole_after_delete() {
+    let key = "ro.scan.hole";
+    let mut area = new_area(16384);
+    area.set_property(key, "value-to-delete").unwrap();
+    let deleted_prop = area.get_property_info(key).unwrap().unwrap();
+
+    assert!(area.delete_property(key).unwrap());
+
+    let scan = area.scan_allocations().unwrap();
+    assert!(scan.holes.iter().any(|hole| {
+        hole.start_offset <= deleted_prop.prop_offset && deleted_prop.prop_offset < hole.end_offset
+    }));
+}
+
+#[test]
+fn scan_allocations_handles_area_without_dirty_backup() {
+    let mut raw = vec![0u8; 1024];
+
+    // Header
+    write_u32(&mut raw, 0, 44); // bytes_used
+    write_u32(&mut raw, 8, PROP_AREA_MAGIC);
+    write_u32(&mut raw, 12, PROP_AREA_VERSION);
+
+    // root node at data offset 0: namelen=0, children=20
+    let data0 = PROP_AREA_HEADER_SIZE as usize;
+    write_u32(&mut raw, data0 + 0, 0);
+    write_u32(&mut raw, data0 + 4, 0);
+    write_u32(&mut raw, data0 + 8, 0);
+    write_u32(&mut raw, data0 + 12, 0);
+    write_u32(&mut raw, data0 + 16, 20);
+
+    // child trie node at data offset 20: name="ro"
+    let child = data0 + 20;
+    write_u32(&mut raw, child + 0, 2);
+    write_u32(&mut raw, child + 4, 0);
+    write_u32(&mut raw, child + 8, 0);
+    write_u32(&mut raw, child + 12, 0);
+    write_u32(&mut raw, child + 16, 0);
+    raw[child + 20] = b'r';
+    raw[child + 21] = b'o';
+    raw[child + 22] = 0;
+
+    let mut area = PropArea::new(Cursor::new(raw)).unwrap();
+    let scan = area.scan_allocations().unwrap();
+
+    assert!(!scan.has_dirty_backup);
+    assert!(scan
+        .objects
+        .iter()
+        .all(|obj| obj.kind != PropAreaObjectKind::DirtyBackup));
+    assert_eq!(scan.holes.len(), 0);
 }

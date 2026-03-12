@@ -22,6 +22,7 @@
 //! sysprop area { --context <CTX> | --path <FILE> } set <KEY> <VALUE>
 //! sysprop area { --context <CTX> | --path <FILE> } del <KEY>
 //! sysprop area { --context <CTX> | --path <FILE> } list
+//! sysprop area { --context <CTX> | --path <FILE> } scan [--objects]
 //! ```
 //!
 //! # Global options
@@ -41,7 +42,9 @@ use std::process;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use memmap2::{Mmap, MmapMut, MmapOptions};
 
-use resetprop_rs::{PropArea, PropAreaError, PropertyContext};
+use resetprop_rs::{
+    PropArea, PropAreaAllocationScan, PropAreaError, PropAreaObjectKind, PropertyContext,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI definition
@@ -204,6 +207,13 @@ enum AreaCommand {
 
     /// List all properties in this area.
     List,
+
+    /// Scan allocation objects/holes in this prop area.
+    Scan {
+        /// Print detailed object list in addition to holes.
+        #[arg(long)]
+        objects: bool,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -397,6 +407,59 @@ fn resolve_area_path(
         (None, None) => Err("area: exactly one of --context or --path is required".into()),
         (Some(_), Some(_)) => Err("area: --context and --path are mutually exclusive".into()),
     }
+}
+
+fn object_kind_name(kind: PropAreaObjectKind) -> &'static str {
+    match kind {
+        PropAreaObjectKind::TrieNode => "trie-node",
+        PropAreaObjectKind::DirtyBackup => "dirty-backup",
+        PropAreaObjectKind::PropInfo => "prop-info",
+        PropAreaObjectKind::LongValue => "long-value",
+    }
+}
+
+fn print_allocation_scan(report: &PropAreaAllocationScan, show_objects: bool) {
+    println!("bytes_used={}", report.bytes_used);
+    println!("has_dirty_backup={}", report.has_dirty_backup);
+
+    if show_objects {
+        println!("objects({}):", report.objects.len());
+        for (index, object) in report.objects.iter().enumerate() {
+            println!(
+                "  [{index:03}] {:<10} off={} size={} aligned={} end={} aligned_end={} detail={}",
+                object_kind_name(object.kind),
+                object.offset,
+                object.size,
+                object.aligned_size,
+                object.end_offset,
+                object.aligned_end_offset,
+                object.detail
+            );
+        }
+    }
+
+    println!("holes({}):", report.holes.len());
+    if report.holes.is_empty() {
+        println!("  (none)");
+        return;
+    }
+
+    for (index, hole) in report.holes.iter().enumerate() {
+        println!(
+            "  [{index:03}] start={} end={} size={} aligned={}",
+            hole.start_offset,
+            hole.end_offset,
+            hole.size,
+            hole.aligned_size
+        );
+    }
+}
+
+fn cmd_area_scan(area_path: &Path, show_objects: bool) -> AppResult<()> {
+    let mut area = open_area_ro(area_path)?;
+    let report = area.scan_allocations().map_err(prop_area_err)?;
+    print_allocation_scan(&report, show_objects);
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -671,6 +734,10 @@ fn cmd_area(props_dir: Option<&Path>, system_root: Option<&Path>, args: &AreaArg
                 let tag = if p.is_long { " [long]" } else { "" };
                 println!("{}={}{}", p.name, p.value, tag);
             }
+        }
+
+        AreaCommand::Scan { objects } => {
+            cmd_area_scan(&area_path, *objects)?;
         }
     }
     Ok(())
