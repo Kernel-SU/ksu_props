@@ -1,0 +1,2 @@
+[alias]
+android-sysprop = "run --bin cargo_android_sysprop --"
