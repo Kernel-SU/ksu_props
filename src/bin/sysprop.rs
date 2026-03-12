@@ -916,7 +916,8 @@ fn cmd_set(
     area.into_inner().flush().map_err(|e| path_io_err(&area_path, e))?;
 
     // Also persist to the persistent property file so the value survives reboot.
-    if persistent.enabled() {
+    // Only properties whose name starts with "persist." are stored in persistent_properties.
+    if persistent.enabled() && key.starts_with("persist.") {
         let path = default_persistent_prop_path();
         let mut props = load_persistent_props_or_default(path)?;
         props.set(key, value);
@@ -939,15 +940,17 @@ fn cmd_del(
 
     let mut area = open_area_rw(&area_path)?;
     let deleted = area.delete_property(key).map_err(prop_area_err)?;
-    if !deleted && !persistent.enabled() {
-        // Only fail fast here when not also checking persistent storage below.
+    // Fail fast when we won't be checking persistent storage either.
+    let will_check_persistent = persistent.enabled() && key.starts_with("persist.");
+    if !deleted && !will_check_persistent {
         eprintln!("{key}: property not found");
         process::exit(1);
     }
     area.into_inner().flush().map_err(|e| path_io_err(&area_path, e))?;
 
     // Also delete from persistent property file.
-    if persistent.enabled() {
+    // Only properties whose name starts with "persist." are stored in persistent_properties.
+    if persistent.enabled() && key.starts_with("persist.") {
         let path = default_persistent_prop_path();
         let mut props = load_persistent_props_or_default(path)?;
         let persistent_deleted = props.delete(key);
@@ -1050,12 +1053,18 @@ fn cmd_persistent_file(args: &PersistentFileArgs) -> AppResult<()> {
         }
 
         PersistentFileCommand::Set { key, value } => {
+            if !key.starts_with("persist.") {
+                eprintln!("warning: '{key}' does not start with 'persist.' — only persist.* properties are normally stored in persistent_properties");
+            }
             let mut props = load_persistent_props_or_default(&path)?;
             props.set(key, value);
             save_persistent_props(&path, &props)?;
         }
 
         PersistentFileCommand::Del { key } => {
+            if !key.starts_with("persist.") {
+                eprintln!("warning: '{key}' does not start with 'persist.' — only persist.* properties are normally stored in persistent_properties");
+            }
             let mut props = load_persistent_props(&path)?;
             if !props.delete(key) {
                 eprintln!("{key}: property not found");
