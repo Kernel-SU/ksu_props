@@ -6,12 +6,13 @@
 //! prop area):
 //!
 //! ```text
-//! sysprop get <KEY>
-//! sysprop set <KEY> <VALUE>
-//! sysprop del <KEY>
-//! sysprop list [--context <CTX>] [--show-context] [--error-output <auto|on|off>]
+//! sysprop get <KEY> [--persistent]
+//! sysprop set <KEY> <VALUE> [--persistent]
+//! sysprop del <KEY> [--persistent]
+//! sysprop list [--context <CTX>] [--show-context] [--error-output <auto|on|off>] [--persistent]
 //! sysprop scan [--context <CTX>] [--objects] [--error-output <auto|on|off>]
 //! sysprop compact [--context <CTX>] [--error-output <auto|on|off>]
+//! sysprop persistent-file [--path <FILE>] { get | set | del | list }
 //! sysprop getcontext <KEY>
 //! sysprop dump-context <CONTEXT>
 //! sysprop list-contexts [--existing-only]
@@ -45,8 +46,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use memmap2::{Mmap, MmapMut, MmapOptions};
 
 use resetprop_rs::{
-    CompactResult, PropArea, PropAreaAllocationScan, PropAreaError, PropAreaObjectKind,
-    PropertyContext,
+    CompactResult, PersistentPropertyFile, PropArea, PropAreaAllocationScan, PropAreaError,
+    PropAreaObjectKind, PropertyContext, ANDROID_PERSISTENT_PROP_FILE,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,6 +84,9 @@ enum Commands {
     Get {
         /// Property name, e.g. `ro.build.fingerprint`.
         key: String,
+
+        #[command(flatten)]
+        persistent: PersistentOpt,
     },
 
     /// Set a property value (routes through the context system).
@@ -93,12 +97,18 @@ enum Commands {
         key: String,
         /// New value.
         value: String,
+
+        #[command(flatten)]
+        persistent: PersistentOpt,
     },
 
     /// Delete a property (routes through the context system).
     Del {
         /// Property name.
         key: String,
+
+        #[command(flatten)]
+        persistent: PersistentOpt,
     },
 
     /// List all properties across every context.
@@ -115,6 +125,9 @@ enum Commands {
         /// `auto` = disabled on Android targets, enabled elsewhere.
         #[arg(long, value_enum, default_value_t = ErrorOutputMode::Auto)]
         error_output: ErrorOutputMode,
+
+        #[command(flatten)]
+        persistent: PersistentOpt,
     },
 
     /// Scan allocation objects/holes across every context.
@@ -127,7 +140,7 @@ enum Commands {
         #[arg(long)]
         objects: bool,
 
-        /// Controls aggregated error output while compacting multiple prop areas.
+        /// Controls aggregated error output while scanning multiple prop areas.
         /// `auto` = disabled on Android targets, enabled elsewhere.
         #[arg(long, value_enum, default_value_t = ErrorOutputMode::Auto)]
         error_output: ErrorOutputMode,
@@ -139,11 +152,15 @@ enum Commands {
         #[arg(long)]
         context: Option<String>,
 
-        /// Controls aggregated error output while scanning multiple prop areas.
+        /// Controls aggregated error output while compacting multiple prop areas.
         /// `auto` = disabled on Android targets, enabled elsewhere.
         #[arg(long, value_enum, default_value_t = ErrorOutputMode::Auto)]
         error_output: ErrorOutputMode,
     },
+
+    /// Operate directly on a persistent property protobuf file.
+    #[command(name = "persistent-file")]
+    PersistentFile(PersistentFileArgs),
 
     /// Print the SELinux context string that owns a property name.
     Getcontext {
@@ -195,6 +212,63 @@ impl ErrorOutputMode {
     const fn auto_enabled() -> bool {
         true
     }
+}
+
+#[derive(Debug, Clone, Copy, Args, Default)]
+struct PersistentOpt {
+    /// Android only: use /data/property/persistent_properties instead of prop area contexts.
+    #[cfg(target_os = "android")]
+    #[arg(long)]
+    persistent: bool,
+}
+
+impl PersistentOpt {
+    #[cfg(target_os = "android")]
+    const fn enabled(self) -> bool {
+        self.persistent
+    }
+
+    #[cfg(not(target_os = "android"))]
+    const fn enabled(self) -> bool {
+        false
+    }
+}
+
+#[derive(Args)]
+struct PersistentFileArgs {
+    /// Path to persistent_properties protobuf file.
+    /// On Android this defaults to /data/property/persistent_properties.
+    #[arg(long)]
+    path: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: PersistentFileCommand,
+}
+
+#[derive(Subcommand)]
+enum PersistentFileCommand {
+    /// Get one persistent property by key.
+    Get {
+        /// Property name.
+        key: String,
+    },
+
+    /// Set one persistent property value.
+    Set {
+        /// Property name.
+        key: String,
+        /// New value.
+        value: String,
+    },
+
+    /// Delete one persistent property.
+    Del {
+        /// Property name.
+        key: String,
+    },
+
+    /// List all persistent properties.
+    List,
 }
 
 /// Arguments for the `area` subcommand.
@@ -410,6 +484,42 @@ fn open_area_rw_detailed(path: &Path) -> Result<MmapRwArea, OpenAreaDetailedErro
         .map_err(OpenAreaDetailedError::Io)?;
     let map = unsafe { MmapOptions::new().map_mut(&f) }.map_err(OpenAreaDetailedError::Io)?;
     PropArea::new(MmapCursor::new(map)).map_err(OpenAreaDetailedError::Parse)
+}
+
+fn default_persistent_prop_path() -> &'static Path {
+    Path::new(ANDROID_PERSISTENT_PROP_FILE)
+}
+
+fn resolve_persistent_file_path(path: Option<&Path>) -> AppResult<PathBuf> {
+    if let Some(path) = path {
+        return Ok(path.to_path_buf());
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        Ok(default_persistent_prop_path().to_path_buf())
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        Err("persistent-file: --path is required on non-Android targets".into())
+    }
+}
+
+fn load_persistent_props(path: &Path) -> AppResult<PersistentPropertyFile> {
+    PersistentPropertyFile::load(path)
+        .map_err(|err| format!("{}: {err}", path.display()).into())
+}
+
+fn load_persistent_props_or_default(path: &Path) -> AppResult<PersistentPropertyFile> {
+    PersistentPropertyFile::load_or_default(path)
+        .map_err(|err| format!("{}: {err}", path.display()).into())
+}
+
+fn save_persistent_props(path: &Path, props: &PersistentPropertyFile) -> AppResult<()> {
+    props
+        .write_to_path(path)
+        .map_err(|err| format!("{}: {err}", path.display()).into())
 }
 
 fn require_props_dir<'a>(props_dir: Option<&'a Path>) -> AppResult<&'a Path> {
@@ -751,7 +861,27 @@ fn cmd_compact(
 // Command implementations
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn cmd_get(props_dir: Option<&Path>, system_root: Option<&Path>, key: &str) -> AppResult<()> {
+fn cmd_get(
+    props_dir: Option<&Path>,
+    system_root: Option<&Path>,
+    key: &str,
+    persistent: PersistentOpt,
+) -> AppResult<()> {
+    if persistent.enabled() {
+        let path = default_persistent_prop_path();
+        let props = load_persistent_props_or_default(path)?;
+        match props.get(key) {
+            Some(value) => {
+                println!("{value}");
+                return Ok(());
+            }
+            None => {
+                eprintln!("{key}: property not found");
+                process::exit(1);
+            }
+        }
+    }
+
     let pc = load_context(props_dir, system_root)?;
     let ctx_name = pc.get_context_for_name(key);
     let area_path = pc.context_file_path(ctx_name);
@@ -774,28 +904,60 @@ fn cmd_set(
     system_root: Option<&Path>,
     key: &str,
     value: &str,
+    persistent: PersistentOpt,
 ) -> AppResult<()> {
+    // Always write to prop area.
     let pc = load_context(props_dir, system_root)?;
     let ctx_name = pc.get_context_for_name(key);
     let area_path = pc.context_file_path(ctx_name);
 
     let mut area = open_area_rw(&area_path)?;
     area.set_property(key, value).map_err(prop_area_err)?;
-    area.into_inner().flush().map_err(|e| path_io_err(&area_path, e))
+    area.into_inner().flush().map_err(|e| path_io_err(&area_path, e))?;
+
+    // Also persist to the persistent property file so the value survives reboot.
+    if persistent.enabled() {
+        let path = default_persistent_prop_path();
+        let mut props = load_persistent_props_or_default(path)?;
+        props.set(key, value);
+        save_persistent_props(path, &props)?;
+    }
+
+    Ok(())
 }
 
-fn cmd_del(props_dir: Option<&Path>, system_root: Option<&Path>, key: &str) -> AppResult<()> {
+fn cmd_del(
+    props_dir: Option<&Path>,
+    system_root: Option<&Path>,
+    key: &str,
+    persistent: PersistentOpt,
+) -> AppResult<()> {
+    // Always delete from prop area.
     let pc = load_context(props_dir, system_root)?;
     let ctx_name = pc.get_context_for_name(key);
     let area_path = pc.context_file_path(ctx_name);
 
     let mut area = open_area_rw(&area_path)?;
     let deleted = area.delete_property(key).map_err(prop_area_err)?;
-    if !deleted {
+    if !deleted && !persistent.enabled() {
+        // Only fail fast here when not also checking persistent storage below.
         eprintln!("{key}: property not found");
         process::exit(1);
     }
     area.into_inner().flush().map_err(|e| path_io_err(&area_path, e))?;
+
+    // Also delete from persistent property file.
+    if persistent.enabled() {
+        let path = default_persistent_prop_path();
+        let mut props = load_persistent_props_or_default(path)?;
+        let persistent_deleted = props.delete(key);
+        if !deleted && !persistent_deleted {
+            eprintln!("{key}: property not found");
+            process::exit(1);
+        }
+        save_persistent_props(path, &props)?;
+    }
+
     Ok(())
 }
 
@@ -805,7 +967,25 @@ fn cmd_list(
     filter_context: Option<&str>,
     show_context: bool,
     error_output: ErrorOutputMode,
+    persistent: PersistentOpt,
 ) -> AppResult<()> {
+    if persistent.enabled() {
+        if filter_context.is_some() {
+            return Err("--context is not supported together with --persistent".into());
+        }
+
+        let path = default_persistent_prop_path();
+        let props = load_persistent_props_or_default(path)?;
+        for prop in props.iter() {
+            if show_context {
+                println!("[persistent] {}={}", prop.name, prop.value);
+            } else {
+                println!("{}={}", prop.name, prop.value);
+            }
+        }
+        return Ok(());
+    }
+
     let pc = load_context(props_dir, system_root)?;
     let specific_context = filter_context.is_some();
     let emit_error_output = error_output.enabled();
@@ -849,6 +1029,47 @@ fn cmd_list(
             skipped_missing,
             &other_errors,
         );
+    }
+
+    Ok(())
+}
+
+fn cmd_persistent_file(args: &PersistentFileArgs) -> AppResult<()> {
+    let path = resolve_persistent_file_path(args.path.as_deref())?;
+
+    match &args.command {
+        PersistentFileCommand::Get { key } => {
+            let props = load_persistent_props(&path)?;
+            match props.get(key) {
+                Some(value) => println!("{value}"),
+                None => {
+                    eprintln!("{key}: property not found");
+                    process::exit(1);
+                }
+            }
+        }
+
+        PersistentFileCommand::Set { key, value } => {
+            let mut props = load_persistent_props_or_default(&path)?;
+            props.set(key, value);
+            save_persistent_props(&path, &props)?;
+        }
+
+        PersistentFileCommand::Del { key } => {
+            let mut props = load_persistent_props(&path)?;
+            if !props.delete(key) {
+                eprintln!("{key}: property not found");
+                process::exit(1);
+            }
+            save_persistent_props(&path, &props)?;
+        }
+
+        PersistentFileCommand::List => {
+            let props = load_persistent_props(&path)?;
+            for prop in props.iter() {
+                println!("{}={}", prop.name, prop.value);
+            }
+        }
     }
 
     Ok(())
@@ -1022,19 +1243,25 @@ fn run() -> AppResult<()> {
     let system_root: Option<&Path> = cli.system_root.as_deref();
 
     match &cli.command {
-        Commands::Get { key } => cmd_get(props_dir, system_root, key),
-        Commands::Set { key, value } => cmd_set(props_dir, system_root, key, value),
-        Commands::Del { key } => cmd_del(props_dir, system_root, key),
+        Commands::Get { key, persistent } => cmd_get(props_dir, system_root, key, *persistent),
+        Commands::Set {
+            key,
+            value,
+            persistent,
+        } => cmd_set(props_dir, system_root, key, value, *persistent),
+        Commands::Del { key, persistent } => cmd_del(props_dir, system_root, key, *persistent),
         Commands::List {
             context,
             show_context,
             error_output,
+            persistent,
         } => cmd_list(
             props_dir,
             system_root,
             context.as_deref(),
             *show_context,
             *error_output,
+            *persistent,
         ),
         Commands::Scan {
             context,
@@ -1056,6 +1283,7 @@ fn run() -> AppResult<()> {
         Commands::ListContexts { existing_only } => {
             cmd_list_contexts(props_dir, system_root, *existing_only)
         }
+        Commands::PersistentFile(args) => cmd_persistent_file(args),
         Commands::Area(area_args) => cmd_area(props_dir, system_root, area_args),
     }
 }
