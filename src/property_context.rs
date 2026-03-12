@@ -541,6 +541,13 @@ impl PropertyContext {
         }
     }
 
+    /// Returns the SELinux context string for `prop_name` as an owned [`String`].
+    ///
+    /// This name is kept for compatibility with older call sites.
+    pub fn get_property_for_name(&self, prop_name: &str) -> String {
+        self.get_context_for_name(prop_name).to_string()
+    }
+
     /// Which storage format is in use.
     pub fn context_type(&self) -> ContextType {
         match &self.storage {

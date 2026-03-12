@@ -28,7 +28,7 @@
 //!
 //! | Option | Non-Android | Android |
 //! |---|---|---|
-//! | `--props-dir` | **required** | optional (default `/dev/__properties__`) |
+//! | `--props-dir` | optional（上下文相关命令需要） | optional (default `/dev/__properties__`) |
 //! | `--system-root` | optional | optional (default `/`) |
 
 use std::collections::BTreeSet;
@@ -55,8 +55,8 @@ struct Cli {
 
     /// Path to /dev/__properties__ or an offline copy of that directory.
     #[cfg(not(target_os = "android"))]
-    #[arg(long, required = true)]
-    props_dir: PathBuf,
+    #[arg(long)]
+    props_dir: Option<PathBuf>,
 
     /// System-root path used to locate SELinux property_contexts files when
     /// the storage format is Split (older Android without property_info).
@@ -206,8 +206,16 @@ fn open_area_rw(path: &Path) -> AppResult<PropArea<File>> {
     PropArea::new(f).map_err(prop_area_err)
 }
 
-/// Load `PropertyContext` from the global CLI options.
-fn load_context(props_dir: &Path, system_root: Option<&Path>) -> AppResult<PropertyContext> {
+fn require_props_dir<'a>(props_dir: Option<&'a Path>) -> AppResult<&'a Path> {
+    props_dir.ok_or_else(|| {
+        "--props-dir is required for this command (or build for Android to use default /dev/__properties__)"
+            .into()
+    })
+}
+
+/// Load `PropertyContext` from global CLI options.
+fn load_context(props_dir: Option<&Path>, system_root: Option<&Path>) -> AppResult<PropertyContext> {
+    let props_dir = require_props_dir(props_dir)?;
     PropertyContext::new(props_dir, system_root).map_err(|e| {
         format!(
             "failed to load property context from '{}': {e}",
@@ -217,10 +225,18 @@ fn load_context(props_dir: &Path, system_root: Option<&Path>) -> AppResult<Prope
     })
 }
 
-/// Validate `AreaArgs` and return the resolved file path.
-fn resolve_area_path(args: &AreaArgs, pc: &PropertyContext) -> AppResult<(String, PathBuf)> {
+/// Validate `AreaArgs` and resolve `(context_label, area_path)`.
+///
+/// For `--path`, no `PropertyContext` is needed.
+/// For `--context`, a property context must be loadable.
+fn resolve_area_path(
+    args: &AreaArgs,
+    props_dir: Option<&Path>,
+    system_root: Option<&Path>,
+) -> AppResult<(String, PathBuf)> {
     match (&args.context, &args.path) {
         (Some(ctx), None) => {
+            let pc = load_context(props_dir, system_root)?;
             let path = pc.context_file_path(ctx);
             Ok((ctx.clone(), path))
         }
@@ -240,7 +256,7 @@ fn resolve_area_path(args: &AreaArgs, pc: &PropertyContext) -> AppResult<(String
 // Command implementations
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn cmd_get(props_dir: &Path, system_root: Option<&Path>, key: &str) -> AppResult<()> {
+fn cmd_get(props_dir: Option<&Path>, system_root: Option<&Path>, key: &str) -> AppResult<()> {
     let pc = load_context(props_dir, system_root)?;
     let ctx_name = pc.get_context_for_name(key);
     let area_path = pc.context_file_path(ctx_name);
@@ -258,7 +274,12 @@ fn cmd_get(props_dir: &Path, system_root: Option<&Path>, key: &str) -> AppResult
     }
 }
 
-fn cmd_set(props_dir: &Path, system_root: Option<&Path>, key: &str, value: &str) -> AppResult<()> {
+fn cmd_set(
+    props_dir: Option<&Path>,
+    system_root: Option<&Path>,
+    key: &str,
+    value: &str,
+) -> AppResult<()> {
     let pc = load_context(props_dir, system_root)?;
     let ctx_name = pc.get_context_for_name(key);
     let area_path = pc.context_file_path(ctx_name);
@@ -267,7 +288,7 @@ fn cmd_set(props_dir: &Path, system_root: Option<&Path>, key: &str, value: &str)
     area.set_property(key, value).map_err(prop_area_err)
 }
 
-fn cmd_del(props_dir: &Path, system_root: Option<&Path>, key: &str) -> AppResult<()> {
+fn cmd_del(props_dir: Option<&Path>, system_root: Option<&Path>, key: &str) -> AppResult<()> {
     let pc = load_context(props_dir, system_root)?;
     let ctx_name = pc.get_context_for_name(key);
     let area_path = pc.context_file_path(ctx_name);
@@ -282,7 +303,7 @@ fn cmd_del(props_dir: &Path, system_root: Option<&Path>, key: &str) -> AppResult
 }
 
 fn cmd_list(
-    props_dir: &Path,
+    props_dir: Option<&Path>,
     system_root: Option<&Path>,
     filter_context: Option<&str>,
     show_context: bool,
@@ -317,14 +338,14 @@ fn cmd_list(
     Ok(())
 }
 
-fn cmd_getcontext(props_dir: &Path, system_root: Option<&Path>, key: &str) -> AppResult<()> {
+fn cmd_getcontext(props_dir: Option<&Path>, system_root: Option<&Path>, key: &str) -> AppResult<()> {
     let pc = load_context(props_dir, system_root)?;
     println!("{}", pc.get_context_for_name(key));
     Ok(())
 }
 
 fn cmd_dump_context(
-    props_dir: &Path,
+    props_dir: Option<&Path>,
     system_root: Option<&Path>,
     context: &str,
 ) -> AppResult<()> {
@@ -373,7 +394,7 @@ fn cmd_dump_context(
 }
 
 fn cmd_list_contexts(
-    props_dir: &Path,
+    props_dir: Option<&Path>,
     system_root: Option<&Path>,
     existing_only: bool,
 ) -> AppResult<()> {
@@ -387,8 +408,9 @@ fn cmd_list_contexts(
         .collect();
 
     // Contexts that actually have a file on disk (may include extras not in parser).
-    let from_files: BTreeSet<String> = if props_dir.is_dir() {
-        match fs::read_dir(props_dir) {
+    let props_root = pc.props_dir();
+    let from_files: BTreeSet<String> = if props_root.is_dir() {
+        match fs::read_dir(props_root) {
             Ok(iter) => iter
                 .flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -416,9 +438,8 @@ fn cmd_list_contexts(
     Ok(())
 }
 
-fn cmd_area(props_dir: &Path, system_root: Option<&Path>, args: &AreaArgs) -> AppResult<()> {
-    let pc = load_context(props_dir, system_root)?;
-    let (ctx_label, area_path) = resolve_area_path(args, &pc)?;
+fn cmd_area(props_dir: Option<&Path>, system_root: Option<&Path>, args: &AreaArgs) -> AppResult<()> {
+    let (ctx_label, area_path) = resolve_area_path(args, props_dir, system_root)?;
 
     match &args.command {
         AreaCommand::Get { key } => {
@@ -480,7 +501,13 @@ fn cmd_area(props_dir: &Path, system_root: Option<&Path>, args: &AreaArgs) -> Ap
 
 fn run() -> AppResult<()> {
     let cli = Cli::parse();
-    let props_dir: &Path = &cli.props_dir;
+
+    #[cfg(target_os = "android")]
+    let props_dir: Option<&Path> = Some(cli.props_dir.as_path());
+
+    #[cfg(not(target_os = "android"))]
+    let props_dir: Option<&Path> = cli.props_dir.as_deref();
+
     let system_root: Option<&Path> = cli.system_root.as_deref();
 
     match &cli.command {
