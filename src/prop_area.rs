@@ -1,21 +1,25 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::mem::offset_of;
 
 use crate::prop_info::{
-    align_up, PropertyInfo, INITIAL_BYTES_USED, LONG_LEGACY_ERROR, LONG_OFFSET_IN_INFO,
+    align_up, PropertyInfo, RawLongProperty, RawPropAreaHeader, RawPropInfoHeader,
+    RawTrieNodeHeader, INITIAL_BYTES_USED, LONG_LEGACY_ERROR, LONG_OFFSET_IN_INFO,
     PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC, PROP_AREA_VERSION, PROP_INFO_SIZE,
     PROP_TRIE_NODE_HEADER_SIZE, PROP_VALUE_MAX,
 };
 
-const BYTES_USED_OFFSET: u64 = 0;
-const MAGIC_OFFSET: u64 = 8;
-const VERSION_OFFSET: u64 = 12;
+// ── Offset constants derived entirely from the repr(C) structs ────────────────
 
-const NODE_PROP_OFFSET: u32 = 4;
-const NODE_LEFT_OFFSET: u32 = 8;
-const NODE_RIGHT_OFFSET: u32 = 12;
-const NODE_CHILDREN_OFFSET: u32 = 16;
+const BYTES_USED_OFFSET: u64 = offset_of!(RawPropAreaHeader, bytes_used) as u64;
+const MAGIC_OFFSET:      u64 = offset_of!(RawPropAreaHeader, magic)      as u64;
+const VERSION_OFFSET:    u64 = offset_of!(RawPropAreaHeader, version)    as u64;
+
+const NODE_PROP_OFFSET:     u32 = offset_of!(RawTrieNodeHeader, prop)     as u32;
+const NODE_LEFT_OFFSET:     u32 = offset_of!(RawTrieNodeHeader, left)     as u32;
+const NODE_RIGHT_OFFSET:    u32 = offset_of!(RawTrieNodeHeader, right)    as u32;
+const NODE_CHILDREN_OFFSET: u32 = offset_of!(RawTrieNodeHeader, children) as u32;
 
 pub type Result<T> = std::result::Result<T, PropAreaError>;
 
@@ -264,11 +268,11 @@ impl<M: Read + Seek> PropArea<M> {
 
     fn read_node(&mut self, offset: u32) -> Result<TrieNodeRecord> {
         let header = self.read_data(offset, PROP_TRIE_NODE_HEADER_SIZE)?;
-        let namelen = u32::from_le_bytes(header[0..4].try_into().unwrap());
-        let prop = u32::from_le_bytes(header[4..8].try_into().unwrap());
-        let left = u32::from_le_bytes(header[8..12].try_into().unwrap());
-        let right = u32::from_le_bytes(header[12..16].try_into().unwrap());
-        let children = u32::from_le_bytes(header[16..20].try_into().unwrap());
+        let namelen  = read_u32_at(&header, offset_of!(RawTrieNodeHeader, namelen));
+        let prop     = read_u32_at(&header, offset_of!(RawTrieNodeHeader, prop));
+        let left     = read_u32_at(&header, offset_of!(RawTrieNodeHeader, left));
+        let right    = read_u32_at(&header, offset_of!(RawTrieNodeHeader, right));
+        let children = read_u32_at(&header, offset_of!(RawTrieNodeHeader, children));
 
         let name = if namelen == 0 {
             String::new()
@@ -293,10 +297,8 @@ impl<M: Read + Seek> PropArea<M> {
         let is_long = self.is_long_prop(prop_offset, name.len() as u32, &header)?;
 
         let value_offset = if is_long {
-            let long_offset = u32::from_le_bytes(
-                header[LONG_OFFSET_IN_INFO as usize..LONG_OFFSET_IN_INFO as usize + 4]
-                    .try_into()
-                    .unwrap(),
+            let long_offset = read_u32_at(&header,
+                offset_of!(RawPropInfoHeader, value) + offset_of!(RawLongProperty, offset),
             );
             prop_offset
                 .checked_add(long_offset)
@@ -327,7 +329,8 @@ impl<M: Read + Seek> PropArea<M> {
 
     fn is_long_prop(&mut self, prop_offset: u32, name_len: u32, header: &[u8]) -> Result<bool> {
         let error_bytes = LONG_LEGACY_ERROR.as_bytes();
-        let union_bytes = &header[4..4 + PROP_VALUE_MAX];
+        let value_off = offset_of!(RawPropInfoHeader, value);
+        let union_bytes = &header[value_off..value_off + PROP_VALUE_MAX];
         if union_bytes.len() < error_bytes.len() + 1 {
             return Ok(false);
         }
@@ -340,10 +343,9 @@ impl<M: Read + Seek> PropArea<M> {
             return Ok(false);
         }
 
-        let long_offset = u32::from_le_bytes(
-            header[LONG_OFFSET_IN_INFO as usize..LONG_OFFSET_IN_INFO as usize + 4]
-                .try_into()
-                .unwrap(),
+        let long_offset = read_u32_at(
+            header,
+            offset_of!(RawPropInfoHeader, value) + offset_of!(RawLongProperty, offset),
         );
         let min_long_offset = align_up(PROP_INFO_SIZE + name_len + 1, 4);
         if long_offset < min_long_offset {
@@ -625,10 +627,9 @@ impl<M: Read + Write + Seek> PropArea<M> {
 
     fn update_long_property(&mut self, prop_offset: u32, name: &str, value: &str) -> Result<()> {
         let header = self.read_data(prop_offset, PROP_INFO_SIZE)?;
-        let current_rel = u32::from_le_bytes(
-            header[LONG_OFFSET_IN_INFO as usize..LONG_OFFSET_IN_INFO as usize + 4]
-                .try_into()
-                .unwrap(),
+        let current_rel = read_u32_at(
+            &header,
+            offset_of!(RawPropInfoHeader, value) + offset_of!(RawLongProperty, offset),
         );
         let current_offset = prop_offset
             .checked_add(current_rel)
@@ -776,6 +777,10 @@ impl<M: Read + Write + Seek> PropArea<M> {
         }
         Ok(())
     }
+}
+
+fn read_u32_at(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
 }
 
 fn cmp_prop_name(one: &str, two: &str) -> std::cmp::Ordering {
