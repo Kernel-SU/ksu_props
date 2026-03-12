@@ -6,7 +6,7 @@ use std::mem::offset_of;
 use crate::prop_info::{
     align_up, PropertyInfo, RawLongProperty, RawPropAreaHeader, RawPropInfoHeader,
     RawTrieNodeHeader, INITIAL_BYTES_USED, LONG_LEGACY_ERROR, LONG_OFFSET_IN_INFO,
-    PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC, PROP_AREA_VERSION, PROP_INFO_SIZE,
+    PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC, PROP_AREA_VERSION, PROP_INFO_LONG_FLAG, PROP_INFO_SIZE,
     PROP_TRIE_NODE_HEADER_SIZE, PROP_VALUE_MAX,
 };
 
@@ -20,6 +20,8 @@ const NODE_PROP_OFFSET:     u32 = offset_of!(RawTrieNodeHeader, prop)     as u32
 const NODE_LEFT_OFFSET:     u32 = offset_of!(RawTrieNodeHeader, left)     as u32;
 const NODE_RIGHT_OFFSET:    u32 = offset_of!(RawTrieNodeHeader, right)    as u32;
 const NODE_CHILDREN_OFFSET: u32 = offset_of!(RawTrieNodeHeader, children) as u32;
+
+const PROP_SERIAL_OFFSET: u32 = offset_of!(RawPropInfoHeader, serial) as u32;
 
 pub type Result<T> = std::result::Result<T, PropAreaError>;
 
@@ -294,12 +296,17 @@ impl<M: Read + Seek> PropArea<M> {
     fn read_prop_record(&mut self, prop_offset: u32) -> Result<PropRecord> {
         let header = self.read_data(prop_offset, PROP_INFO_SIZE)?;
         let name = self.read_c_string(prop_offset + PROP_INFO_SIZE, None)?;
-        let is_long = self.is_long_prop(prop_offset, name.len() as u32, &header)?;
+        let is_long = self.is_long_prop(&header);
 
         let value_offset = if is_long {
             let long_offset = read_u32_at(&header,
                 offset_of!(RawPropInfoHeader, value) + offset_of!(RawLongProperty, offset),
             );
+            let min_long_offset = align_up(PROP_INFO_SIZE + name.len() as u32 + 1, 4);
+            if long_offset < min_long_offset {
+                return Err(PropAreaError::Corrupted("long property offset points into prop_info"));
+            }
+
             prop_offset
                 .checked_add(long_offset)
                 .ok_or(PropAreaError::InvalidOffset(prop_offset))?
@@ -327,44 +334,9 @@ impl<M: Read + Seek> PropArea<M> {
         })
     }
 
-    fn is_long_prop(&mut self, prop_offset: u32, name_len: u32, header: &[u8]) -> Result<bool> {
-        let error_bytes = LONG_LEGACY_ERROR.as_bytes();
-        let value_off = offset_of!(RawPropInfoHeader, value);
-        let union_bytes = &header[value_off..value_off + PROP_VALUE_MAX];
-        if union_bytes.len() < error_bytes.len() + 1 {
-            return Ok(false);
-        }
-
-        if &union_bytes[..error_bytes.len()] != error_bytes {
-            return Ok(false);
-        }
-
-        if union_bytes[error_bytes.len()] != 0 {
-            return Ok(false);
-        }
-
-        let long_offset = read_u32_at(
-            header,
-            offset_of!(RawPropInfoHeader, value) + offset_of!(RawLongProperty, offset),
-        );
-        let min_long_offset = align_up(PROP_INFO_SIZE + name_len + 1, 4);
-        if long_offset < min_long_offset {
-            return Ok(false);
-        }
-
-        let value_offset = match prop_offset.checked_add(long_offset) {
-            Some(value_offset) => value_offset,
-            None => return Ok(false),
-        };
-        if value_offset >= self.data_size {
-            return Ok(false);
-        }
-
-        match self.read_c_string(value_offset, None) {
-            Ok(_) => Ok(true),
-            Err(PropAreaError::Corrupted(_)) | Err(PropAreaError::InvalidOffset(_)) => Ok(false),
-            Err(err) => Err(err),
-        }
+    fn is_long_prop(&self, header: &[u8]) -> bool {
+        let serial = read_u32_at(header, offset_of!(RawPropInfoHeader, serial));
+        (serial & PROP_INFO_LONG_FLAG) != 0
     }
 
     fn for_each_from<F>(
@@ -617,6 +589,8 @@ impl<M: Read + Write + Seek> PropArea<M> {
         self.zero_data(prop_offset + 4, PROP_VALUE_MAX as u32)?;
         self.write_bytes_data(prop_offset + 4, value.as_bytes())?;
         self.write_bytes_data(prop_offset + 4 + value.len() as u32, &[0])?;
+        let serial = (value.len() as u32) << 24;
+        self.write_u32_data(prop_offset + PROP_SERIAL_OFFSET, serial)?;
         Ok(())
     }
 
@@ -667,6 +641,12 @@ impl<M: Read + Write + Seek> PropArea<M> {
         self.write_bytes_data(prop_offset + 4, LONG_LEGACY_ERROR.as_bytes())?;
         self.write_bytes_data(prop_offset + 4 + LONG_LEGACY_ERROR.len() as u32, &[0])?;
         self.write_u32_data(prop_offset + LONG_OFFSET_IN_INFO, relative_offset)?;
+        let error_len = u32::try_from(LONG_LEGACY_ERROR.len())
+            .map_err(|_| PropAreaError::Corrupted("legacy error marker too long"))?;
+        self.write_u32_data(
+            prop_offset + PROP_SERIAL_OFFSET,
+            (error_len << 24) | PROP_INFO_LONG_FLAG,
+        )?;
 
         self.write_bytes_data(long_value_offset, value.as_bytes())?;
         self.write_bytes_data(long_value_offset + value.len() as u32, &[0])?;

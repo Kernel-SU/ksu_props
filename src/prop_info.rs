@@ -6,7 +6,8 @@ pub const PROP_VALUE_MAX: usize = 92;
 pub const PROP_NAME_MAX: usize = 32;
 pub(crate) const LONG_LEGACY_ERROR_BUFFER_SIZE: usize = 56;
 pub(crate) const LONG_LEGACY_ERROR: &str =
-    "Must use resetprop_property_read_callback() to read";
+    "Must use __system_property_read_callback() to read";
+pub(crate) const PROP_INFO_LONG_FLAG: u32 = 1 << 16;
 
 // ── repr(C) mirrors of the on-disk / in-memory C++ structs ───────────────────
 
