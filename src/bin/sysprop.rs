@@ -43,7 +43,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use memmap2::{Mmap, MmapMut, MmapOptions};
 
 use resetprop_rs::{
-    PropArea, PropAreaAllocationScan, PropAreaError, PropAreaObjectKind, PropertyContext,
+    CompactResult, PropArea, PropAreaAllocationScan, PropAreaError, PropAreaObjectKind,
+    PropertyContext,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -203,6 +204,9 @@ enum AreaCommand {
     Del {
         /// Property name.
         key: String,
+        /// After deleting, compact the allocation space to reclaim holes.
+        #[arg(long)]
+        compact: bool,
     },
 
     /// List all properties in this area.
@@ -214,6 +218,9 @@ enum AreaCommand {
         #[arg(long)]
         objects: bool,
     },
+
+    /// Compact the prop area, eliminating holes left by deleted properties.
+    Compact,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -462,6 +469,35 @@ fn cmd_area_scan(area_path: &Path, show_objects: bool) -> AppResult<()> {
     Ok(())
 }
 
+fn cmd_area_compact(area_path: &Path) -> AppResult<()> {
+    let mut area = open_area_rw(area_path)?;
+    let result = area.compact_allocations().map_err(prop_area_err)?;
+    area.into_inner().flush().map_err(|e| path_io_err(area_path, e))?;
+    match result {
+        CompactResult::NoHoles => {
+            eprintln!("compact: no holes found, area is already fully packed");
+        }
+        CompactResult::AdjustedBytesUsed { old, new } => {
+            eprintln!(
+                "compact: reclaimed trailing hole — bytes_used {} → {} (freed {})",
+                old,
+                new,
+                old - new,
+            );
+        }
+        CompactResult::MovedObjects { old, new, objects_moved } => {
+            eprintln!(
+                "compact: moved {} object(s) — bytes_used {} → {} (freed {})",
+                objects_moved,
+                old,
+                new,
+                old - new,
+            );
+        }
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Command implementations
 // ─────────────────────────────────────────────────────────────────────────────
@@ -701,12 +737,15 @@ fn cmd_area(props_dir: Option<&Path>, system_root: Option<&Path>, args: &AreaArg
             area.into_inner().flush().map_err(|e| path_io_err(&area_path, e))?;
         }
 
-        AreaCommand::Del { key } => {
+        AreaCommand::Del { key, compact } => {
             let mut area = open_area_rw(&area_path)?;
             let deleted = area.delete_property(key).map_err(prop_area_err)?;
             if !deleted {
                 eprintln!("{key}: property not found");
                 process::exit(1);
+            }
+            if *compact {
+                area.compact_allocations().map_err(prop_area_err)?;
             }
             area.into_inner().flush().map_err(|e| path_io_err(&area_path, e))?;
         }
@@ -738,6 +777,10 @@ fn cmd_area(props_dir: Option<&Path>, system_root: Option<&Path>, args: &AreaArg
 
         AreaCommand::Scan { objects } => {
             cmd_area_scan(&area_path, *objects)?;
+        }
+
+        AreaCommand::Compact => {
+            cmd_area_compact(&area_path)?;
         }
     }
     Ok(())

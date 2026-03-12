@@ -164,6 +164,37 @@ pub struct PropAreaAllocationScan {
     pub holes:            Vec<PropAreaHoleInfo>,
 }
 
+/// Describes the outcome of [`PropArea::compact_allocations`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactResult {
+    /// No holes were found; the area is already fully packed.
+    NoHoles,
+    /// Only a trailing hole existed.  `bytes_used` was updated to reclaim it;
+    /// no objects were moved.
+    AdjustedBytesUsed { old: u32, new: u32 },
+    /// One or more interior holes existed.  Objects after the first hole were
+    /// moved forward to eliminate all gaps, and `bytes_used` was updated.
+    MovedObjects { old: u32, new: u32, objects_moved: usize },
+}
+
+/// Internal record used by the compaction pass.
+struct CompactRecord {
+    /// Data-space offset of this allocation.
+    offset:       u32,
+    /// Aligned size of this allocation in bytes.
+    aligned_size: u32,
+    /// Data-space offset of the object whose field holds a reference to this
+    /// allocation.  `None` for the root trie node and the dirty-backup area.
+    referer_data: Option<u32>,
+    /// Byte offset of the reference field within the referer object.
+    refer_off:    Option<u32>,
+    /// For long-value allocations: the data-space offset of the owning
+    /// `prop_info` record.  The long-value reference is stored as a relative
+    /// offset from `prop_info`, so the new relative value must be recomputed
+    /// whenever either object is moved.
+    long_ref_prop: Option<u32>,
+}
+
 impl<M: Read + Seek> PropArea<M> {
     pub fn new(inner: M) -> Result<Self> {
         let mut inner = inner;
@@ -303,6 +334,81 @@ impl<M: Read + Seek> PropArea<M> {
         }
 
         Ok(true)
+    }
+
+    /// Collect `CompactRecord`s for every allocation reachable from `offset`,
+    /// recursing into left/right siblings and children.
+    fn collect_compact_records_from(
+        &mut self,
+        offset:       u32,
+        referer_data: Option<u32>,
+        refer_off:    Option<u32>,
+        seen_nodes:   &mut BTreeSet<u32>,
+        seen_props:   &mut BTreeSet<u32>,
+        seen_longs:   &mut BTreeSet<u32>,
+        records:      &mut Vec<CompactRecord>,
+    ) -> Result<()> {
+        if seen_nodes.contains(&offset) {
+            return Ok(());
+        }
+        seen_nodes.insert(offset);
+
+        let node = self.read_node(offset)?;
+        let node_size = if node.namelen == 0 {
+            PROP_TRIE_NODE_HEADER_SIZE
+        } else {
+            PROP_TRIE_NODE_HEADER_SIZE + node.namelen + 1
+        };
+        records.push(CompactRecord {
+            offset,
+            aligned_size: align_up(node_size, 4),
+            referer_data,
+            refer_off,
+            long_ref_prop: None,
+        });
+
+        if node.prop != 0 && seen_props.insert(node.prop) {
+            let rec = self.read_prop_record(node.prop)?;
+            let name_len = rec.name.len() as u32;
+            records.push(CompactRecord {
+                offset:       node.prop,
+                aligned_size: align_up(PROP_INFO_SIZE + name_len + 1, 4),
+                referer_data: Some(offset),
+                refer_off:    Some(NODE_PROP_OFFSET),
+                long_ref_prop: None,
+            });
+            if rec.is_long && seen_longs.insert(rec.value_offset) {
+                let value_alloc = rec.value.len() as u32 + 1;
+                records.push(CompactRecord {
+                    offset:        rec.value_offset,
+                    aligned_size:  align_up(value_alloc, 4),
+                    referer_data:  Some(node.prop),
+                    refer_off:     Some(LONG_OFFSET_IN_INFO),
+                    long_ref_prop: Some(node.prop),
+                });
+            }
+        }
+
+        if node.left != 0 {
+            self.collect_compact_records_from(
+                node.left, Some(offset), Some(NODE_LEFT_OFFSET),
+                seen_nodes, seen_props, seen_longs, records,
+            )?;
+        }
+        if node.children != 0 {
+            self.collect_compact_records_from(
+                node.children, Some(offset), Some(NODE_CHILDREN_OFFSET),
+                seen_nodes, seen_props, seen_longs, records,
+            )?;
+        }
+        if node.right != 0 {
+            self.collect_compact_records_from(
+                node.right, Some(offset), Some(NODE_RIGHT_OFFSET),
+                seen_nodes, seen_props, seen_longs, records,
+            )?;
+        }
+
+        Ok(())
     }
 
     fn from_inner_with_size(inner: M, area_size: u64) -> Result<Self> {
@@ -776,6 +882,122 @@ impl<M: Read + Write + Seek> PropArea<M> {
         self.wipe_prop_info(prop_offset)?;
         let _ = self.prune_trie(0)?;
         Ok(true)
+    }
+
+    /// Compact the allocation space by eliminating holes left by previous
+    /// deletions.
+    ///
+    /// * If no holes exist the area is left untouched and [`CompactResult::NoHoles`] is returned.
+    /// * If only a trailing hole exists only `bytes_used` is updated.
+    /// * Otherwise every live allocation beyond the first hole is moved forward
+    ///   (in-place, maintaining order), all intra-area references are patched,
+    ///   and `bytes_used` is updated.
+    pub fn compact_allocations(&mut self) -> Result<CompactResult> {
+        let bytes_used = self.bytes_used()?;
+        let has_dirty  = self.has_dirty_backup()?;
+
+        // Build a reference-tracking record for every live allocation.
+        let mut records: Vec<CompactRecord> = Vec::new();
+        let mut seen_nodes = BTreeSet::new();
+        let mut seen_props = BTreeSet::new();
+        let mut seen_longs = BTreeSet::new();
+
+        if has_dirty {
+            records.push(CompactRecord {
+                offset:        PROP_TRIE_NODE_HEADER_SIZE,
+                aligned_size:  DIRTY_BACKUP_SIZE,
+                referer_data:  None,
+                refer_off:     None,
+                long_ref_prop: None,
+            });
+        }
+
+        self.collect_compact_records_from(
+            0, None, None,
+            &mut seen_nodes, &mut seen_props, &mut seen_longs,
+            &mut records,
+        )?;
+
+        records.sort_by_key(|r| r.offset);
+
+        // Walk through records in offset order to find the first hole.
+        let initial = if has_dirty { INITIAL_BYTES_USED } else { PROP_TRIE_NODE_HEADER_SIZE };
+        let mut cursor = initial;
+        let mut first_hole_idx: Option<usize> = None;
+        for (i, rec) in records.iter().enumerate() {
+            if rec.offset > cursor {
+                first_hole_idx = Some(i);
+                break;
+            }
+            let end = rec.offset + rec.aligned_size;
+            if end > cursor {
+                cursor = end;
+            }
+        }
+
+        match first_hole_idx {
+            None => {
+                // No interior holes. Check for a trailing one.
+                if cursor < bytes_used {
+                    let old = bytes_used;
+                    self.write_u32_abs(BYTES_USED_OFFSET, cursor)?;
+                    return Ok(CompactResult::AdjustedBytesUsed { old, new: cursor });
+                }
+                Ok(CompactResult::NoHoles)
+            }
+            Some(first_idx) => {
+                let old = bytes_used;
+                let objects_moved = records.len() - first_idx;
+
+                // Compute new positions: pack everything from cursor onwards.
+                let mut offset_remap: std::collections::HashMap<u32, u32> =
+                    std::collections::HashMap::new();
+                let mut new_cursor = cursor;
+                for rec in &records[first_idx..] {
+                    offset_remap.insert(rec.offset, new_cursor);
+                    new_cursor += rec.aligned_size;
+                }
+
+                // Move each allocation and patch the reference pointing to it.
+                for rec in &records[first_idx..] {
+                    let new_offset = *offset_remap.get(&rec.offset).unwrap();
+
+                    if let (Some(ref_dat), Some(ref_off)) = (rec.referer_data, rec.refer_off) {
+                        // The referer itself may have been moved; look up its new position.
+                        let new_ref_dat =
+                            offset_remap.get(&ref_dat).copied().unwrap_or(ref_dat);
+                        let field = new_ref_dat + ref_off;
+
+                        if let Some(prop_orig) = rec.long_ref_prop {
+                            // Long-value reference is relative (long_abs − prop_info_abs).
+                            let new_prop =
+                                offset_remap.get(&prop_orig).copied().unwrap_or(prop_orig);
+                            self.write_u32_data(field, new_offset - new_prop)?;
+                        } else {
+                            self.write_u32_data(field, new_offset)?;
+                        }
+                    }
+
+                    // Copy the allocation to its compacted position.
+                    // new_offset < rec.offset always (we're filling holes), so
+                    // reading first then writing is safe.
+                    if new_offset != rec.offset {
+                        let data = self.read_data(rec.offset, rec.aligned_size)?;
+                        self.write_bytes_data(new_offset, &data)?;
+                    }
+                }
+
+                // Zero the reclaimed tail and update bytes_used.
+                self.zero_data(new_cursor, bytes_used - new_cursor)?;
+                self.write_u32_abs(BYTES_USED_OFFSET, new_cursor)?;
+
+                Ok(CompactResult::MovedObjects {
+                    old,
+                    new: new_cursor,
+                    objects_moved,
+                })
+            }
+        }
     }
 
     fn ensure_traverse_trie(&mut self, key: &str) -> Result<u32> {

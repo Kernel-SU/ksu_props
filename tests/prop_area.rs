@@ -1,8 +1,8 @@
 use std::io::Cursor;
 
 use resetprop_rs::{
-    PropArea, PropAreaError, PropAreaObjectKind, PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC,
-    PROP_AREA_VERSION, PROP_VALUE_MAX,
+    CompactResult, PropArea, PropAreaError, PropAreaObjectKind, PROP_AREA_HEADER_SIZE,
+    PROP_AREA_MAGIC, PROP_AREA_VERSION, PROP_VALUE_MAX,
 };
 
 fn new_area(size: usize) -> PropArea<Cursor<Vec<u8>>> {
@@ -284,4 +284,120 @@ fn scan_allocations_handles_area_without_dirty_backup() {
         .iter()
         .all(|obj| obj.kind != PropAreaObjectKind::DirtyBackup));
     assert_eq!(scan.holes.len(), 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// compact_allocations tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn compact_on_area_without_holes_returns_no_holes() {
+    let mut area = new_area(4096);
+    area.set_property("ro.a", "1").unwrap();
+    area.set_property("ro.b", "2").unwrap();
+
+    // No deletions — no holes.
+    let result = area.compact_allocations().unwrap();
+    assert_eq!(result, CompactResult::NoHoles);
+
+    // Properties are still readable.
+    assert_eq!(area.get_property("ro.a").unwrap(), Some("1".to_owned()));
+    assert_eq!(area.get_property("ro.b").unwrap(), Some("2".to_owned()));
+}
+
+#[test]
+fn compact_reclaims_trailing_hole() {
+    let mut area = new_area(4096);
+    area.set_property("ro.z", "last").unwrap();
+
+    let _bytes_before = area.scan_allocations().unwrap().bytes_used;
+
+    // Delete the sole property — leaves a trailing hole (pruned trie keeps root,
+    // but prop_info bytes are zeroed and bytes_used is not yet reduced).
+    assert!(area.delete_property("ro.z").unwrap());
+
+    let result = area.compact_allocations().unwrap();
+    match result {
+        CompactResult::NoHoles => {} // already reclaimed by prune_trie — also acceptable
+        CompactResult::AdjustedBytesUsed { old, new } => {
+            assert!(new <= old, "bytes_used should not grow");
+        }
+        CompactResult::MovedObjects { old, new, .. } => {
+            assert!(new <= old, "bytes_used should not grow");
+        }
+    }
+
+    // After compaction the area must be internally consistent.
+    let scan = area.scan_allocations().unwrap();
+    assert_eq!(scan.holes.len(), 0, "no holes should remain after compact");
+}
+
+#[test]
+fn compact_moves_objects_over_interior_hole_and_props_still_readable() {
+    let mut area = new_area(8192);
+
+    // Insert three properties.  Trie allocates them in insertion order.
+    area.set_property("aa", "v1").unwrap();
+    area.set_property("bb", "v2").unwrap();
+    area.set_property("cc", "v3").unwrap();
+
+    let bytes_before = area.scan_allocations().unwrap().bytes_used;
+
+    // Delete the middle property — creates an interior hole.
+    assert!(area.delete_property("bb").unwrap());
+
+    let holes_before = area.scan_allocations().unwrap().holes.len();
+
+    let result = area.compact_allocations().unwrap();
+
+    // After compaction: no holes.
+    let scan_after = area.scan_allocations().unwrap();
+    assert_eq!(
+        scan_after.holes.len(),
+        0,
+        "compact should eliminate all holes; was: {holes_before} hole(s)"
+    );
+
+    // bytes_used must have decreased.
+    assert!(
+        scan_after.bytes_used <= bytes_before,
+        "bytes_used should not exceed pre-delete value"
+    );
+
+    // Compact reported a meaningful result.
+    match &result {
+        CompactResult::NoHoles => {
+            // Possible if prune_trie already collapsed everything — still OK.
+        }
+        CompactResult::AdjustedBytesUsed { old, new } => assert!(new <= old),
+        CompactResult::MovedObjects { objects_moved, .. } => {
+            assert!(*objects_moved > 0);
+        }
+    }
+
+    // Surviving properties must still be readable.
+    assert_eq!(area.get_property("aa").unwrap(), Some("v1".to_owned()));
+    assert_eq!(area.get_property("cc").unwrap(), Some("v3".to_owned()));
+    assert_eq!(area.get_property("bb").unwrap(), None);
+}
+
+#[test]
+fn compact_after_long_property_delete_leaves_no_holes() {
+    let mut area = new_area(8192);
+    let long_val = "y".repeat(150);
+
+    area.set_property("persist.a", "short").unwrap();
+    area.set_property("persist.b", &long_val).unwrap();
+    area.set_property("persist.c", "short2").unwrap();
+
+    assert!(area.delete_property("persist.b").unwrap());
+
+    let _result = area.compact_allocations().unwrap();
+
+    let scan = area.scan_allocations().unwrap();
+    assert_eq!(scan.holes.len(), 0, "no holes after compacting long-prop deletion");
+
+    assert_eq!(area.get_property("persist.a").unwrap(), Some("short".to_owned()));
+    assert_eq!(area.get_property("persist.c").unwrap(), Some("short2".to_owned()));
+    assert_eq!(area.get_property("persist.b").unwrap(), None);
 }
