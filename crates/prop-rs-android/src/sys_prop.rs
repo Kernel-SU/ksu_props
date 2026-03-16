@@ -1,21 +1,26 @@
-//! Bionic `__system_property_*` API wrapper via `dlsym`.
+//! Bionic `__system_property_*` API wrapper via `dlsym` + `prop-rs` mmap.
 //!
-//! This module dynamically loads Android bionic's system property functions at
-//! runtime and exposes a safe Rust API.  It implements the same dual-channel
-//! write logic as Magisk's resetprop:
+//! This module dynamically loads Android bionic's **standard** system property
+//! functions at runtime and exposes a safe Rust API.  For operations that
+//! stock bionic does not support (add, update, delete, get_context), we use
+//! `prop-rs`'s pure-Rust `PropArea` implementation operating directly on the
+//! mmap'd shared-memory files under `/dev/__properties__`.
 //!
-//! - `ro.*` properties bypass `property_service` and are modified directly via
-//!   `__system_property_update` / `__system_property_add` (shared-memory mmap).
-//! - Other properties go through `__system_property_set` which internally
-//!   connects to init's `property_service` socket.
+//! This replaces Magisk's approach of linking against a patched bionic with
+//! `__system_property_*2` symbols, making the code work on KernelSU without
+//! any bionic modifications.
 
 use std::ffi::{CStr, CString};
 use std::fmt;
-use std::os::raw::{c_char, c_int, c_uint, c_void};
+use std::fs::OpenOptions;
+use std::io::{self, Read, Seek, SeekFrom, Write as IoWrite};
+use std::os::raw::{c_char, c_int, c_void};
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use prop_rs::{PersistentPropError, PROP_VALUE_MAX};
+use memmap2::{MmapMut, MmapOptions};
+use prop_rs::{PropArea, PropAreaError, PropertyContext};
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -27,16 +32,14 @@ pub enum SysPropError {
     InitFailed(c_int),
     /// `__system_property_set` returned a non-zero error code.
     SetFailed(c_int),
-    /// `__system_property_add` returned a non-zero error code.
-    AddFailed(c_int),
-    /// `__system_property_update` returned a non-zero error code.
-    UpdateFailed(c_int),
-    /// `__system_property_del` is unavailable (stock bionic without Magisk).
-    DeleteUnavailable,
+    /// A prop-area operation failed.
+    PropArea(PropAreaError),
+    /// An I/O error occurred during mmap operations.
+    Io(io::Error),
     /// The property key or value contains an interior NUL byte.
     InvalidCString(String),
     /// A persistent-property I/O operation failed.
-    Persistent(PersistentPropError),
+    Persistent(prop_rs::PersistentPropError),
 }
 
 impl fmt::Display for SysPropError {
@@ -45,9 +48,8 @@ impl fmt::Display for SysPropError {
             Self::SymbolNotFound(sym) => write!(f, "bionic symbol not found: {sym}"),
             Self::InitFailed(code) => write!(f, "__system_properties_init failed: {code}"),
             Self::SetFailed(code) => write!(f, "__system_property_set failed: {code}"),
-            Self::AddFailed(code) => write!(f, "__system_property_add failed: {code}"),
-            Self::UpdateFailed(code) => write!(f, "__system_property_update failed: {code}"),
-            Self::DeleteUnavailable => write!(f, "__system_property_del not available"),
+            Self::PropArea(e) => write!(f, "prop area error: {e}"),
+            Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::InvalidCString(s) => write!(f, "invalid C string: {s}"),
             Self::Persistent(e) => write!(f, "persistent property error: {e}"),
         }
@@ -56,9 +58,21 @@ impl fmt::Display for SysPropError {
 
 impl std::error::Error for SysPropError {}
 
-impl From<PersistentPropError> for SysPropError {
-    fn from(e: PersistentPropError) -> Self {
+impl From<prop_rs::PersistentPropError> for SysPropError {
+    fn from(e: prop_rs::PersistentPropError) -> Self {
         Self::Persistent(e)
+    }
+}
+
+impl From<PropAreaError> for SysPropError {
+    fn from(e: PropAreaError) -> Self {
+        Self::PropArea(e)
+    }
+}
+
+impl From<io::Error> for SysPropError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
     }
 }
 
@@ -95,12 +109,8 @@ type FnForEach = unsafe extern "C" fn(
     *mut c_void,
 );
 type FnSet = unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
-type FnAdd = unsafe extern "C" fn(*const c_char, c_uint, *const c_char, c_uint) -> c_int;
-type FnUpdate = unsafe extern "C" fn(*const c_void, *const c_char, c_uint) -> c_int;
-type FnDel = unsafe extern "C" fn(*const c_void) -> c_int;
 type FnSerial = unsafe extern "C" fn(*const c_void) -> u32;
 type FnAreaSerial = unsafe extern "C" fn() -> u32;
-type FnGetContext = unsafe extern "C" fn(*const c_char) -> *const c_char;
 type FnWait = unsafe extern "C" fn(
     *const c_void,         // pi (null = global)
     u32,                   // old serial
@@ -111,19 +121,15 @@ type FnWait = unsafe extern "C" fn(
 // ── Loaded API singleton ────────────────────────────────────────────────────
 
 struct BionicApi {
-    // Required symbols
+    // Standard bionic symbols (available on all Android versions)
     find: FnFind,
     read_callback: FnReadCallback,
     for_each: FnForEach,
     set: FnSet,
-    add: FnAdd,
-    update: FnUpdate,
     serial: FnSerial,
-    // Optional symbols (may not exist on all Android versions / bionic variants)
-    del: Option<FnDel>,
+    // Optional standard symbols (API 26+)
     area_serial: Option<FnAreaSerial>,
     wait: Option<FnWait>,
-    get_context: Option<FnGetContext>,
 }
 
 static API: OnceLock<BionicApi> = OnceLock::new();
@@ -146,9 +152,116 @@ fn api() -> &'static BionicApi {
     API.get().expect("sys_prop::init() must be called first")
 }
 
+// ── MmapCursor ──────────────────────────────────────────────────────────────
+
+/// A `Read + Write + Seek` cursor over a memory-mapped region.
+///
+/// This is the same pattern used by `tools/sysprop/src/main.rs` to bridge
+/// `memmap2::MmapMut` into `prop_rs::PropArea`.
+struct MmapCursor {
+    map: MmapMut,
+    pos: usize,
+}
+
+impl MmapCursor {
+    fn new(map: MmapMut) -> Self {
+        Self { map, pos: 0 }
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        self.map.flush()
+    }
+}
+
+impl Read for MmapCursor {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let data = self.map.as_ref();
+        if self.pos >= data.len() {
+            return Ok(0);
+        }
+        let count = (data.len() - self.pos).min(buf.len());
+        buf[..count].copy_from_slice(&data[self.pos..self.pos + count]);
+        self.pos += count;
+        Ok(count)
+    }
+}
+
+impl Seek for MmapCursor {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let len = self.map.as_ref().len() as i64;
+        let current = self.pos as i64;
+        let next = match pos {
+            SeekFrom::Start(offset) => i64::try_from(offset)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "seek overflow"))?,
+            SeekFrom::End(offset) => len
+                .checked_add(offset)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek overflow"))?,
+            SeekFrom::Current(offset) => current
+                .checked_add(offset)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek overflow"))?,
+        };
+        if next < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot seek before start of mmap",
+            ));
+        }
+        self.pos = usize::try_from(next)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "seek overflow"))?;
+        Ok(self.pos as u64)
+    }
+}
+
+impl IoWrite for MmapCursor {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let data = &mut self.map[..];
+        if self.pos > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "write past end of mmap",
+            ));
+        }
+        let remaining = data.len() - self.pos;
+        if buf.len() > remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "mmap write exceeds mapped region",
+            ));
+        }
+        data[self.pos..self.pos + buf.len()].copy_from_slice(buf);
+        self.pos += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.map.flush()
+    }
+}
+
+// ── PropertyContext singleton ────────────────────────────────────────────────
+
+static PROP_CTX: OnceLock<PropertyContext> = OnceLock::new();
+
+fn prop_ctx() -> SysPropResult<&'static PropertyContext> {
+    PROP_CTX
+        .get()
+        .ok_or_else(|| SysPropError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "PropertyContext not initialized — call sys_prop::init() first",
+        )))
+}
+
+/// Open a prop area file read-write via shared mmap.
+fn open_area_rw(path: &Path) -> SysPropResult<PropArea<MmapCursor>> {
+    let f = OpenOptions::new().read(true).write(true).open(path)?;
+    let map = unsafe { MmapOptions::new().map_mut(&f) }?;
+    Ok(PropArea::new(MmapCursor::new(map))?)
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
-/// Load all bionic symbols and call `__system_properties_init`.
+/// Load bionic symbols, initialize `PropertyContext`, and call
+/// `__system_properties_init`.
 ///
 /// This must be called once before any other function in this module.
 /// Subsequent calls are harmless no-ops.
@@ -164,13 +277,9 @@ pub fn init() -> SysPropResult<()> {
         read_callback: load_sym_required("__system_property_read_callback")?,
         for_each: load_sym_required("__system_property_foreach")?,
         set: load_sym_required("__system_property_set")?,
-        add: load_sym_required("__system_property_add")?,
-        update: load_sym_required("__system_property_update")?,
         serial: load_sym_required("__system_property_serial")?,
-        del: load_sym("__system_property_del"),
         area_serial: load_sym("__system_property_area_serial"),
         wait: load_sym("__system_property_wait"),
-        get_context: load_sym("__system_property_get_context"),
     };
 
     let ret = unsafe { init_fn() };
@@ -179,6 +288,16 @@ pub fn init() -> SysPropResult<()> {
     }
 
     let _ = API.set(bionic);
+
+    // Initialize PropertyContext for prop-rs mmap operations.
+    let _ = PROP_CTX.get_or_init(|| {
+        PropertyContext::new(
+            Path::new("/dev/__properties__"),
+            Some(Path::new("/")),
+        )
+        .expect("failed to load PropertyContext from /dev/__properties__")
+    });
+
     Ok(())
 }
 
@@ -216,19 +335,11 @@ pub fn area_serial() -> Option<u32> {
 
 /// Get the SELinux context of a property by name.
 ///
-/// Requires `__system_property_get_context` (available on Magisk-patched bionic).
-/// Returns `None` if the symbol is unavailable or the key contains a NUL byte.
+/// Uses `prop-rs`'s `PropertyContext` to resolve the context — no patched
+/// bionic required.
 pub fn get_context(key: &str) -> SysPropResult<String> {
-    let get_ctx = api()
-        .get_context
-        .ok_or(SysPropError::SymbolNotFound("__system_property_get_context"))?;
-    let ckey = make_cstring(key)?;
-    let ptr = unsafe { get_ctx(ckey.as_ptr()) };
-    if ptr.is_null() {
-        Ok(String::new())
-    } else {
-        Ok(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
-    }
+    let ctx = prop_ctx()?;
+    Ok(ctx.get_context_for_name(key).to_string())
 }
 
 /// Iterate over all properties.
@@ -277,90 +388,78 @@ pub fn for_each(mut callback: impl FnMut(&str, &str)) {
     }
 }
 
-/// Set a property value using Magisk's dual-channel logic.
+/// Set a property value.
 ///
-/// - For `ro.*` properties: bypasses property_service socket and operates
-///   directly on the shared-memory mmap via `__system_property_update` /
-///   `__system_property_add`.  Long or expanding values are handled by
-///   automatic delete+add.
+/// - For `ro.*` properties or when `skip_svc` is true: bypasses
+///   `property_service` and operates directly on the shared-memory mmap
+///   via `prop-rs`'s `PropArea::set_property`.
 /// - For other properties: uses `__system_property_set` which goes through
-///   init's property_service socket (handles serial updates, triggers, etc.).
-/// - For `persist.*` properties with `skip_svc`: manually persists to disk.
+///   init's `property_service` socket.
 pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
-    let api = api();
-    let ckey = make_cstring(key)?;
-    let cval = make_cstring(value)?;
-
     let force_skip = skip_svc || key.starts_with("ro.");
-    let mut pi = find(key);
 
     if force_skip {
-        if let Some(info) = pi {
-            let needs_long = value.len() >= PROP_VALUE_MAX;
-            if is_long_value(info) || needs_long {
-                // Delete without pruning, then re-add.
-                delete_internal(info)?;
-                pi = None;
-            }
-        }
-    }
-
-    match pi {
-        Some(info) => {
-            if force_skip {
-                let ret = unsafe {
-                    (api.update)(info.as_ptr(), cval.as_ptr(), value.len() as c_uint)
-                };
-                if ret != 0 {
-                    return Err(SysPropError::UpdateFailed(ret));
-                }
-            } else {
-                let ret = unsafe { (api.set)(ckey.as_ptr(), cval.as_ptr()) };
-                if ret != 0 {
-                    return Err(SysPropError::SetFailed(ret));
-                }
-            }
-        }
-        None => {
-            if force_skip {
-                let ret = unsafe {
-                    (api.add)(
-                        ckey.as_ptr(),
-                        key.len() as c_uint,
-                        cval.as_ptr(),
-                        value.len() as c_uint,
-                    )
-                };
-                if ret != 0 {
-                    return Err(SysPropError::AddFailed(ret));
-                }
-            } else {
-                let ret = unsafe { (api.set)(ckey.as_ptr(), cval.as_ptr()) };
-                if ret != 0 {
-                    return Err(SysPropError::SetFailed(ret));
-                }
-            }
+        // Direct mmap write via prop-rs.
+        let ctx = prop_ctx()?;
+        let context = ctx.get_context_for_name(key);
+        let area_path = ctx.context_file_path(context);
+        let mut area = open_area_rw(&area_path)?;
+        area.set_property(key, value)?;
+        area.into_inner().flush()?;
+    } else {
+        // Go through bionic's property_service socket.
+        let ckey = make_cstring(key)?;
+        let cval = make_cstring(value)?;
+        let ret = unsafe { (api().set)(ckey.as_ptr(), cval.as_ptr()) };
+        if ret != 0 {
+            return Err(SysPropError::SetFailed(ret));
         }
     }
 
     Ok(())
 }
 
-/// Delete a property from shared memory.
+/// Delete a property from shared memory via `prop-rs`.
 ///
-/// Requires Magisk's patched bionic which provides `__system_property_del`.
-/// On stock bionic, this returns `SysPropError::DeleteUnavailable`.
+/// Returns `true` if the property existed and was deleted.
 ///
 /// This does **not** touch persistent storage — the caller is responsible
 /// for calling `persist::persist_delete_prop` when appropriate.
 pub fn delete(key: &str) -> SysPropResult<bool> {
-    let pi = match find(key) {
-        Some(pi) => pi,
-        None => return Ok(false),
-    };
+    let ctx = prop_ctx()?;
+    let context = ctx.get_context_for_name(key);
+    let area_path = ctx.context_file_path(context);
+    let mut area = open_area_rw(&area_path)?;
+    let deleted = area.delete_property(key)?;
+    area.into_inner().flush()?;
+    Ok(deleted)
+}
 
-    delete_internal(pi)?;
-    Ok(true)
+/// Compact all prop area files, reclaiming holes left by deletions.
+///
+/// Returns `true` if any area was compacted.
+pub fn compact() -> SysPropResult<bool> {
+    let ctx = prop_ctx()?;
+    let targets = ctx.prop_area_files().map_err(SysPropError::Io)?;
+    let mut any_compacted = false;
+
+    for (_context, path) in &targets {
+        let mut area = match open_area_rw(path) {
+            Ok(area) => area,
+            Err(_) => continue, // skip inaccessible areas
+        };
+        match area.compact_allocations() {
+            Ok(result) => {
+                if !matches!(result, prop_rs::CompactResult::NoHoles) {
+                    any_compacted = true;
+                }
+                area.into_inner().flush()?;
+            }
+            Err(_) => continue,
+        }
+    }
+
+    Ok(any_compacted)
 }
 
 /// Wait for a property to exist or change away from a given value.
@@ -517,28 +616,6 @@ fn read_name_value(pi: PropInfoPtr) -> Option<(String, String)> {
         (api().read_callback)(pi.as_ptr(), Some(cb), &mut cookie as *mut _ as *mut c_void);
     }
     Some((cookie.name?, cookie.value?))
-}
-
-/// Check if a prop_info uses the long-value format.
-///
-/// Bionic encodes `PROP_INFO_LONG_FLAG (1 << 16)` in the serial field.
-/// `__system_property_serial` returns the raw serial which includes this flag.
-fn is_long_value(pi: PropInfoPtr) -> bool {
-    let s = serial(pi);
-    (s & (1 << 16)) != 0
-}
-
-fn delete_internal(pi: PropInfoPtr) -> SysPropResult<()> {
-    match api().del {
-        Some(del_fn) => {
-            let ret = unsafe { del_fn(pi.as_ptr()) };
-            if ret != 0 {
-                return Err(SysPropError::DeleteUnavailable);
-            }
-            Ok(())
-        }
-        None => Err(SysPropError::DeleteUnavailable),
-    }
 }
 
 fn remaining_timespec(deadline: Option<std::time::Instant>) -> Option<libc::timespec> {
