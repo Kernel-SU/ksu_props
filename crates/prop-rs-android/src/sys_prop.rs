@@ -20,7 +20,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use memmap2::{MmapMut, MmapOptions};
-use prop_rs::{PropArea, PropAreaError, PropertyContext};
+use prop_rs::{
+    PropArea, PropAreaError, PropertyContext, AREA_SERIAL_OFFSET, PROP_AREA_HEADER_SIZE,
+    PROP_INFO_SERIAL_OFFSET,
+};
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -171,6 +174,11 @@ impl MmapCursor {
     fn flush(&self) -> io::Result<()> {
         self.map.flush()
     }
+
+    /// Return a raw pointer to the start of the mapped region.
+    fn as_ptr(&self) -> *const u8 {
+        self.map.as_ptr()
+    }
 }
 
 impl Read for MmapCursor {
@@ -266,6 +274,51 @@ fn open_area_rw(path: &Path) -> SysPropResult<PropArea<MmapCursor>> {
     let f = OpenOptions::new().read(true).write(true).open(path)?;
     let map = unsafe { MmapOptions::new().map_mut(&f) }?;
     Ok(PropArea::new(MmapCursor::new(map))?)
+}
+
+// ── Futex helper ────────────────────────────────────────────────────────────
+
+/// Wake all threads waiting on a futex at the given shared-memory address.
+///
+/// # Safety
+///
+/// `addr` must point to a valid, shared-memory `u32` (i.e. inside a
+/// `MAP_SHARED` mmap region).
+unsafe fn futex_wake(addr: *const u32) {
+    libc::syscall(
+        libc::SYS_futex,
+        addr,
+        libc::FUTEX_WAKE,
+        i32::MAX,
+        std::ptr::null::<libc::timespec>(),
+    );
+}
+
+/// Issue futex wakes for a prop serial and the area serial on a mapped
+/// prop-area.
+///
+/// # Safety
+///
+/// `base` must be the start of a shared-memory prop-area mmap.
+unsafe fn wake_prop_and_area(base: *const u8, prop_offset: u32) {
+    let prop_serial_ptr = base
+        .add(PROP_AREA_HEADER_SIZE as usize)
+        .add(prop_offset as usize)
+        .add(PROP_INFO_SERIAL_OFFSET as usize) as *const u32;
+    futex_wake(prop_serial_ptr);
+
+    let area_serial_ptr = base.add(AREA_SERIAL_OFFSET as usize) as *const u32;
+    futex_wake(area_serial_ptr);
+}
+
+/// Issue a futex wake for the area serial only (e.g. after delete).
+///
+/// # Safety
+///
+/// `base` must be the start of a shared-memory prop-area mmap.
+unsafe fn wake_area_serial(base: *const u8) {
+    let area_serial_ptr = base.add(AREA_SERIAL_OFFSET as usize) as *const u32;
+    futex_wake(area_serial_ptr);
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -420,20 +473,35 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
 
     if force_skip {
         // Direct mmap write via prop-rs.
+        // For non-ro properties we bump the serial so that bionic waiters
+        // are notified; for ro properties we keep the serial unchanged to
+        // hide the modification.
+        let bump = !key.starts_with("ro.");
+
         let ctx = prop_ctx()?;
         let context = ctx.get_context_for_name(key);
         let area_path = ctx.context_file_path(context);
         let mut area = open_area_rw(&area_path)?;
-        area.set_property(key, value)?;
-        area.into_inner().flush()?;
+        let result = area.set_property_with_serial(key, value, bump)?;
+        let cursor = area.into_inner();
+        if bump {
+            unsafe { wake_prop_and_area(cursor.as_ptr(), result.prop_offset) };
+        }
+        cursor.flush()?;
 
         // Dual-write to appcompat_override area (Android 14+).
         if let Some(appcompat) = appcompat_ctx() {
             let ctx_name = appcompat.get_context_for_name(key);
             let path = appcompat.context_file_path(ctx_name);
             if let Ok(mut area) = open_area_rw(&path) {
-                let _ = area.set_property(key, value);
-                let _ = area.into_inner().flush();
+                let result = area.set_property_with_serial(key, value, bump);
+                let cursor = area.into_inner();
+                if bump {
+                    if let Ok(r) = &result {
+                        unsafe { wake_prop_and_area(cursor.as_ptr(), r.prop_offset) };
+                    }
+                }
+                let _ = cursor.flush();
             }
         }
     } else {
@@ -461,15 +529,29 @@ pub fn delete(key: &str) -> SysPropResult<bool> {
     let area_path = ctx.context_file_path(context);
     let mut area = open_area_rw(&area_path)?;
     let deleted = area.delete_property(key)?;
-    area.into_inner().flush()?;
+    if deleted {
+        area.bump_area_serial()?;
+    }
+    let cursor = area.into_inner();
+    if deleted {
+        unsafe { wake_area_serial(cursor.as_ptr()) };
+    }
+    cursor.flush()?;
 
     // Dual-delete from appcompat_override area (Android 14+).
     if let Some(appcompat) = appcompat_ctx() {
         let ctx_name = appcompat.get_context_for_name(key);
         let path = appcompat.context_file_path(ctx_name);
         if let Ok(mut area) = open_area_rw(&path) {
-            let _ = area.delete_property(key);
-            let _ = area.into_inner().flush();
+            let del = area.delete_property(key).unwrap_or(false);
+            if del {
+                let _ = area.bump_area_serial();
+            }
+            let cursor = area.into_inner();
+            if del {
+                unsafe { wake_area_serial(cursor.as_ptr()) };
+            }
+            let _ = cursor.flush();
         }
     }
 

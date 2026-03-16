@@ -5,9 +5,10 @@ use std::mem::offset_of;
 
 use crate::prop_info::{
     align_up, PropertyInfo, RawLongProperty, RawPropAreaHeader, RawPropInfoHeader,
-    RawTrieNodeHeader, DIRTY_BACKUP_SIZE, INITIAL_BYTES_USED, LONG_LEGACY_ERROR,
-    LONG_OFFSET_IN_INFO, PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC, PROP_AREA_VERSION,
-    PROP_INFO_LONG_FLAG, PROP_INFO_SIZE, PROP_TRIE_NODE_HEADER_SIZE, PROP_VALUE_MAX,
+    RawTrieNodeHeader, AREA_SERIAL_OFFSET, DIRTY_BACKUP_SIZE, INITIAL_BYTES_USED,
+    LONG_LEGACY_ERROR, LONG_OFFSET_IN_INFO, PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC,
+    PROP_AREA_VERSION, PROP_INFO_LONG_FLAG, PROP_INFO_SIZE, PROP_TRIE_NODE_HEADER_SIZE,
+    PROP_VALUE_MAX,
 };
 
 // ── Offset constants derived entirely from the repr(C) structs ────────────────
@@ -24,6 +25,20 @@ const NODE_CHILDREN_OFFSET: u32 = offset_of!(RawTrieNodeHeader, children) as u32
 const PROP_SERIAL_OFFSET: u32 = offset_of!(RawPropInfoHeader, serial) as u32;
 
 pub type Result<T> = std::result::Result<T, PropAreaError>;
+
+/// Information returned by [`PropArea::set_property_with_serial`] so that the
+/// caller can perform platform-specific follow-up (e.g. futex wake).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PropWriteResult {
+    /// Offset of the `prop_info` record within the data region.
+    /// The file-absolute offset is `PROP_AREA_HEADER_SIZE + prop_offset`.
+    pub prop_offset: u32,
+    /// The prop serial value that was written (includes length in high bits).
+    pub serial: u32,
+    /// `true` when a new property was created; `false` when an existing one
+    /// was updated.
+    pub created: bool,
+}
 
 #[derive(Debug)]
 pub enum PropAreaError {
@@ -849,24 +864,62 @@ impl<M: Read + Write + Seek> PropArea<M> {
     }
 
     pub fn set_property(&mut self, key: &str, value: &str) -> Result<()> {
+        self.set_property_with_serial(key, value, false).map(|_| ())
+    }
+
+    /// Set (or create) a property, optionally bumping the serial numbers.
+    ///
+    /// When `bump_serial` is `true` the prop-info serial counter (low 24 bits)
+    /// is incremented and the area-header serial is incremented.  This is
+    /// required for non-`ro.*` properties so that bionic waiters are notified
+    /// of the change.  The caller is still responsible for issuing the actual
+    /// `futex_wake` calls on the mmap'd addresses — this method only writes
+    /// the new serial values.
+    ///
+    /// When `bump_serial` is `false` the low 24-bit counter is preserved (or
+    /// set to 0 for new properties) to hide the modification from detection
+    /// tools (the Magisk approach for `ro.*` properties).
+    pub fn set_property_with_serial(
+        &mut self,
+        key: &str,
+        value: &str,
+        bump_serial: bool,
+    ) -> Result<PropWriteResult> {
         let node_offset = self.ensure_traverse_trie(key)?;
         let prop_offset = self.read_u32_data(node_offset + NODE_PROP_OFFSET)?;
 
         if prop_offset == 0 {
-            let new_prop_offset = self.create_prop_info(key, value)?;
+            let new_prop_offset = self.create_prop_info(key, value, bump_serial)?;
             self.write_u32_data(node_offset + NODE_PROP_OFFSET, new_prop_offset)?;
-            return Ok(());
+            let serial = self.read_u32_data(new_prop_offset + PROP_SERIAL_OFFSET)?;
+            if bump_serial {
+                self.bump_area_serial()?;
+            }
+            return Ok(PropWriteResult {
+                prop_offset: new_prop_offset,
+                serial,
+                created: true,
+            });
         }
 
         let record = self.read_prop_record(prop_offset)?;
         let result = if record.is_long {
-            self.update_long_property(prop_offset, &record.name, value)
+            self.update_long_property(prop_offset, &record.name, value, bump_serial)
         } else {
-            self.update_inline_property_in_place(prop_offset, &record.name, value)
+            self.update_inline_property_in_place(prop_offset, &record.name, value, bump_serial)
         };
 
         match result {
-            Ok(()) => Ok(()),
+            Ok(serial) => {
+                if bump_serial {
+                    self.bump_area_serial()?;
+                }
+                Ok(PropWriteResult {
+                    prop_offset,
+                    serial,
+                    created: false,
+                })
+            }
             Err(PropAreaError::InPlaceUpdateTooLong { .. }) => {
                 // Value doesn't fit in the current slot (inline → long, or
                 // long value grew beyond its allocation).  Delete without
@@ -874,12 +927,31 @@ impl<M: Read + Write + Seek> PropArea<M> {
                 // the larger value.
                 self.write_u32_data(node_offset + NODE_PROP_OFFSET, 0)?;
                 self.wipe_prop_info(prop_offset)?;
-                let new_prop_offset = self.create_prop_info(key, value)?;
+                let new_prop_offset = self.create_prop_info(key, value, bump_serial)?;
                 self.write_u32_data(node_offset + NODE_PROP_OFFSET, new_prop_offset)?;
-                Ok(())
+                let serial = self.read_u32_data(new_prop_offset + PROP_SERIAL_OFFSET)?;
+                if bump_serial {
+                    self.bump_area_serial()?;
+                }
+                Ok(PropWriteResult {
+                    prop_offset: new_prop_offset,
+                    serial,
+                    created: true,
+                })
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Increment the area-header serial by 1 and return the new value.
+    ///
+    /// The caller is responsible for issuing a `futex_wake` on the
+    /// corresponding mmap address afterwards.
+    pub fn bump_area_serial(&mut self) -> Result<u32> {
+        let old = self.read_u32_abs(AREA_SERIAL_OFFSET)?;
+        let new = old.wrapping_add(1);
+        self.write_u32_abs(AREA_SERIAL_OFFSET, new)?;
+        Ok(new)
     }
 
     pub fn delete_property(&mut self, key: &str) -> Result<bool> {
@@ -1097,15 +1169,15 @@ impl<M: Read + Write + Seek> PropArea<M> {
         Ok(offset)
     }
 
-    fn create_prop_info(&mut self, name: &str, value: &str) -> Result<u32> {
+    fn create_prop_info(&mut self, name: &str, value: &str, bump_serial: bool) -> Result<u32> {
         let name_len = u32::try_from(name.len()).map_err(|_| PropAreaError::Corrupted("name too long"))?;
         let prop_offset = self.allocate_obj(PROP_INFO_SIZE + name_len + 1)?;
 
         self.write_u32_data(prop_offset, 0)?;
         if value.len() >= PROP_VALUE_MAX {
-            self.write_long_layout(prop_offset, name_len, value)?;
+            self.write_long_layout(prop_offset, name_len, value, bump_serial)?;
         } else {
-            self.initialize_inline_property(prop_offset, value)?;
+            self.initialize_inline_property(prop_offset, value, bump_serial)?;
         }
 
         self.write_bytes_data(prop_offset + PROP_INFO_SIZE, name.as_bytes())?;
@@ -1124,18 +1196,25 @@ impl<M: Read + Write + Seek> PropArea<M> {
         Ok(())
     }
 
-    fn initialize_inline_property(&mut self, prop_offset: u32, value: &str) -> Result<()> {
+    fn initialize_inline_property(&mut self, prop_offset: u32, value: &str, bump_serial: bool) -> Result<()> {
         if value.len() >= PROP_VALUE_MAX {
             return Err(PropAreaError::Corrupted("inline property value too large"));
         }
 
         self.write_inline_value_bytes(prop_offset, value)?;
-        let serial = (value.len() as u32) << 24;
+        let counter = if bump_serial { 1u32 } else { 0u32 };
+        let serial = ((value.len() as u32) << 24) | counter;
         self.write_u32_data(prop_offset + PROP_SERIAL_OFFSET, serial)?;
         Ok(())
     }
 
-    fn update_inline_property_in_place(&mut self, prop_offset: u32, name: &str, value: &str) -> Result<()> {
+    fn update_inline_property_in_place(
+        &mut self,
+        prop_offset: u32,
+        name: &str,
+        value: &str,
+        bump_serial: bool,
+    ) -> Result<u32> {
         if value.len() >= PROP_VALUE_MAX {
             return Err(PropAreaError::InPlaceUpdateTooLong {
                 name: name.to_owned(),
@@ -1144,17 +1223,27 @@ impl<M: Read + Write + Seek> PropArea<M> {
             });
         }
 
-        // Read old serial to preserve the low 24-bit counter (à la Magisk).
-        // This hides the modification from detection tools that monitor serial
-        // changes.  Only the length field (high 8 bits) is updated.
         let old_serial = self.read_u32_data(prop_offset + PROP_SERIAL_OFFSET)?;
         self.write_inline_value_bytes(prop_offset, value)?;
-        let new_serial = ((value.len() as u32) << 24) | (old_serial & 0x00ff_ffff);
+        let counter = if bump_serial {
+            ((old_serial & 0x00ff_ffff) + 1) & 0x00ff_ffff
+        } else {
+            // Preserve the low 24-bit counter to hide the modification from
+            // detection tools that monitor serial changes (Magisk approach).
+            old_serial & 0x00ff_ffff
+        };
+        let new_serial = ((value.len() as u32) << 24) | counter;
         self.write_u32_data(prop_offset + PROP_SERIAL_OFFSET, new_serial)?;
-        Ok(())
+        Ok(new_serial)
     }
 
-    fn update_long_property(&mut self, prop_offset: u32, name: &str, value: &str) -> Result<()> {
+    fn update_long_property(
+        &mut self,
+        prop_offset: u32,
+        name: &str,
+        value: &str,
+        bump_serial: bool,
+    ) -> Result<u32> {
         let header = self.read_data(prop_offset, PROP_INFO_SIZE)?;
         let current_rel = read_u32_at(
             &header,
@@ -1178,18 +1267,20 @@ impl<M: Read + Write + Seek> PropArea<M> {
         self.write_bytes_data(current_offset, value.as_bytes())?;
         self.write_bytes_data(current_offset + value.len() as u32, &[0])?;
 
-        // Preserve the low 24-bit serial counter to hide modification traces
-        // (same approach as Magisk).  The long flag and error_len in the high
-        // bits are kept as-is since the legacy error marker doesn't change.
         let old_serial = read_u32_at(&header, offset_of!(RawPropInfoHeader, serial));
         let error_len = u32::try_from(LONG_LEGACY_ERROR.len())
             .map_err(|_| PropAreaError::Corrupted("legacy error marker too long"))?;
-        let new_serial = (error_len << 24) | PROP_INFO_LONG_FLAG | (old_serial & 0x00ff_ffff);
+        let counter = if bump_serial {
+            ((old_serial & 0x00ff_ffff) + 1) & 0x00ff_ffff
+        } else {
+            old_serial & 0x00ff_ffff
+        };
+        let new_serial = (error_len << 24) | PROP_INFO_LONG_FLAG | counter;
         self.write_u32_data(prop_offset + PROP_SERIAL_OFFSET, new_serial)?;
-        Ok(())
+        Ok(new_serial)
     }
 
-    fn write_long_layout(&mut self, prop_offset: u32, name_len: u32, value: &str) -> Result<()> {
+    fn write_long_layout(&mut self, prop_offset: u32, name_len: u32, value: &str, bump_serial: bool) -> Result<()> {
         let long_value_size = u32::try_from(value.len() + 1)
             .map_err(|_| PropAreaError::Corrupted("value too large to store"))?;
         let long_value_offset = self.allocate_obj(long_value_size)?;
@@ -1207,9 +1298,10 @@ impl<M: Read + Write + Seek> PropArea<M> {
         self.write_u32_data(prop_offset + LONG_OFFSET_IN_INFO, relative_offset)?;
         let error_len = u32::try_from(LONG_LEGACY_ERROR.len())
             .map_err(|_| PropAreaError::Corrupted("legacy error marker too long"))?;
+        let counter = if bump_serial { 1u32 } else { 0u32 };
         self.write_u32_data(
             prop_offset + PROP_SERIAL_OFFSET,
-            (error_len << 24) | PROP_INFO_LONG_FLAG,
+            (error_len << 24) | PROP_INFO_LONG_FLAG | counter,
         )?;
 
         self.write_bytes_data(long_value_offset, value.as_bytes())?;

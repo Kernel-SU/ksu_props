@@ -5,11 +5,11 @@ pub mod property_context;
 
 pub use prop_area::{
     CompactResult, PropArea, PropAreaAllocationScan, PropAreaError, PropAreaHoleInfo,
-    PropAreaObjectInfo, PropAreaObjectKind, Result,
+    PropAreaObjectInfo, PropAreaObjectKind, PropWriteResult, Result,
 };
 pub use prop_info::{
-    PropertyInfo, PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC, PROP_AREA_VERSION, PROP_NAME_MAX,
-    PROP_VALUE_MAX,
+    PropertyInfo, AREA_SERIAL_OFFSET, PROP_AREA_HEADER_SIZE, PROP_AREA_MAGIC, PROP_AREA_VERSION,
+    PROP_INFO_SERIAL_OFFSET, PROP_NAME_MAX, PROP_VALUE_MAX,
 };
 pub use persistent_prop::{
     check_proto, legacy_delete_prop, legacy_get_prop, legacy_list_props, legacy_set_prop,

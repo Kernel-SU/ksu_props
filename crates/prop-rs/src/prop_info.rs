@@ -9,6 +9,12 @@ pub(crate) const LONG_LEGACY_ERROR: &str =
     "Must use __system_property_read_callback() to read";
 pub(crate) const PROP_INFO_LONG_FLAG: u32 = 1 << 16;
 
+/// Byte offset of `serial` within `RawPropAreaHeader` (file-absolute offset).
+pub const AREA_SERIAL_OFFSET: u64 = offset_of!(RawPropAreaHeader, serial) as u64;
+
+/// Byte offset of `serial` within `RawPropInfoHeader`.
+pub const PROP_INFO_SERIAL_OFFSET: u32 = offset_of!(RawPropInfoHeader, serial) as u32;
+
 // ── repr(C) mirrors of the on-disk / in-memory C++ structs ───────────────────
 
 /// Mirrors the fixed header of C++ `prop_area` (before the flexible `data_[]` array).
