@@ -234,6 +234,68 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> PersistentResult<()> {
     .into())
 }
 
+// ── Legacy per-file format ──────────────────────────────────────────────────
+//
+// Older Android devices store persistent properties as individual files under
+// `/data/property/` (one file per property, filename = property name, content =
+// value).  This is used as a fallback when `persistent_properties` (protobuf)
+// does not exist.
+
+/// Returns `true` if the protobuf persistent properties file exists under `dir`.
+pub fn check_proto(dir: &Path) -> bool {
+    dir.join("persistent_properties").exists()
+}
+
+/// Read a single property from the legacy per-file storage.
+pub fn legacy_get_prop(dir: &Path, key: &str) -> PersistentResult<Option<String>> {
+    let path = dir.join(key);
+    match fs::read_to_string(&path) {
+        Ok(val) => Ok(Some(val)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Write a single property to the legacy per-file storage using atomic write.
+pub fn legacy_set_prop(dir: &Path, key: &str, value: &str) -> PersistentResult<()> {
+    let path = dir.join(key);
+    write_bytes_atomically(&path, value.as_bytes())
+}
+
+/// Delete a single property from the legacy per-file storage.
+pub fn legacy_delete_prop(dir: &Path, key: &str) -> PersistentResult<bool> {
+    let path = dir.join(key);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// List all properties stored in the legacy per-file format.
+pub fn legacy_list_props(dir: &Path) -> PersistentResult<Vec<PersistentProperty>> {
+    let mut props = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(props),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "persistent_properties" || name.starts_with('.') {
+            continue;
+        }
+        if let Ok(value) = fs::read_to_string(entry.path()) {
+            props.push(PersistentProperty { name, value });
+        }
+    }
+    props.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(props)
+}
+
+// ── Protobuf message types ──────────────────────────────────────────────────
+
 #[derive(Clone, PartialEq, Message)]
 struct ProtoPersistentProperties {
     #[prost(message, repeated, tag = "1")]

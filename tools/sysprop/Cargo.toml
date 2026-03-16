@@ -1,0 +1,21 @@
+[package]
+name = "sysprop"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sysprop"
+path = "src/main.rs"
+
+[[bin]]
+name = "read_props"
+path = "src/read_props.rs"
+
+[[bin]]
+name = "write_props"
+path = "src/write_props.rs"
+
+[dependencies]
+prop-rs = { path = "../../crates/prop-rs" }
+clap = { version = "4", features = ["derive"] }
+memmap2 = "0.9"

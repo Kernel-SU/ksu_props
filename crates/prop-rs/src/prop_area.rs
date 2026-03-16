@@ -859,16 +859,43 @@ impl<M: Read + Write + Seek> PropArea<M> {
         }
 
         let record = self.read_prop_record(prop_offset)?;
-        if record.is_long {
-            self.update_long_property(prop_offset, &record.name, value)?;
+        let result = if record.is_long {
+            self.update_long_property(prop_offset, &record.name, value)
         } else {
-            self.update_inline_property_in_place(prop_offset, &record.name, value)?;
-        }
+            self.update_inline_property_in_place(prop_offset, &record.name, value)
+        };
 
-        Ok(())
+        match result {
+            Ok(()) => Ok(()),
+            Err(PropAreaError::InPlaceUpdateTooLong { .. }) => {
+                // Value doesn't fit in the current slot (inline → long, or
+                // long value grew beyond its allocation).  Delete without
+                // pruning and re-create so the new allocation can accommodate
+                // the larger value.
+                self.write_u32_data(node_offset + NODE_PROP_OFFSET, 0)?;
+                self.wipe_prop_info(prop_offset)?;
+                let new_prop_offset = self.create_prop_info(key, value)?;
+                self.write_u32_data(node_offset + NODE_PROP_OFFSET, new_prop_offset)?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn delete_property(&mut self, key: &str) -> Result<bool> {
+        self.delete_property_inner(key, true)
+    }
+
+    /// Delete a property without pruning empty trie nodes.
+    ///
+    /// This is useful for the delete+add pattern (e.g. when converting an
+    /// inline property to a long property) where the trie node will be reused
+    /// immediately after deletion.
+    pub fn delete_property_no_prune(&mut self, key: &str) -> Result<bool> {
+        self.delete_property_inner(key, false)
+    }
+
+    fn delete_property_inner(&mut self, key: &str, prune: bool) -> Result<bool> {
         let Some(node_offset) = self.traverse_trie(key)? else {
             return Ok(false);
         };
@@ -880,7 +907,9 @@ impl<M: Read + Write + Seek> PropArea<M> {
 
         self.write_u32_data(node_offset + NODE_PROP_OFFSET, 0)?;
         self.wipe_prop_info(prop_offset)?;
-        let _ = self.prune_trie(0)?;
+        if prune {
+            let _ = self.prune_trie(0)?;
+        }
         Ok(true)
     }
 

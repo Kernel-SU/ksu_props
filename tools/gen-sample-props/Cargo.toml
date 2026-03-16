@@ -1,0 +1,11 @@
+[package]
+name = "gen-sample-props"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gen_sample_props"
+path = "src/main.rs"
+
+[dependencies]
+prop-rs = { path = "../../crates/prop-rs" }

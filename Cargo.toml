@@ -1,31 +1,10 @@
-[package]
-name = "resetprop-rs"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-path = "src/lib.rs"
-
-[[bin]]
-name = "read_props"
-path = "src/bin/read_props.rs"
-
-[[bin]]
-name = "write_props"
-path = "src/bin/write_props.rs"
-
-[[bin]]
-name = "gen_sample_props"
-path = "src/bin/gen_sample_props.rs"
-[[bin]]
-name = "sysprop"
-path = "src/bin/sysprop.rs"
-
-[[bin]]
-name = "cargo_android_sysprop"
-path = "src/bin/cargo_android_sysprop.rs"
-
-[dependencies]
-clap = { version = "4", features = ["derive"] }
-memmap2 = "0.9"
-prost = "0.13"
+[workspace]
+members = [
+    "crates/prop-rs",
+    "crates/prop-rs-android",
+    "tools/sysprop",
+    "tools/resetprop",
+    "tools/gen-sample-props",
+    "tools/cargo-android-sysprop",
+]
+resolver = "2"

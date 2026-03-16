@@ -45,7 +45,7 @@ use std::process;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use memmap2::{Mmap, MmapMut, MmapOptions};
 
-use resetprop_rs::{
+use prop_rs::{
     CompactResult, PersistentPropertyFile, PropArea, PropAreaAllocationScan, PropAreaError,
     PropAreaObjectKind, PropertyContext, ANDROID_PERSISTENT_PROP_FILE,
 };

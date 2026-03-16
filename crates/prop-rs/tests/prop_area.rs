@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
-use resetprop_rs::{
-    CompactResult, PropArea, PropAreaError, PropAreaObjectKind, PROP_AREA_HEADER_SIZE,
+use prop_rs::{
+    CompactResult, PropArea, PropAreaObjectKind, PROP_AREA_HEADER_SIZE,
     PROP_AREA_MAGIC, PROP_AREA_VERSION, PROP_VALUE_MAX,
 };
 
@@ -163,25 +163,24 @@ fn update_long_keeps_serial_and_updates_in_place() {
 }
 
 #[test]
-fn update_long_rejects_growth_without_reallocation() {
+fn update_long_auto_delete_add_on_growth() {
     let key = "persist.sys.long.noalloc";
     let old_value = "x".repeat(120);
     let new_value = "y".repeat(121);
 
     let mut area = new_area(16384);
     area.set_property(key, &old_value).unwrap();
-    let before = area.get_property_info(key).unwrap().unwrap();
 
-    let err = area.set_property(key, &new_value).unwrap_err();
-    assert!(matches!(err, PropAreaError::InPlaceUpdateTooLong { .. }));
+    // Should automatically delete+add when long value grows beyond allocation.
+    area.set_property(key, &new_value).unwrap();
 
     let after = area.get_property_info(key).unwrap().unwrap();
-    assert_eq!(after.value, old_value);
-    assert_eq!(after.value_offset, before.value_offset);
+    assert_eq!(after.value, new_value);
+    assert!(after.is_long);
 }
 
 #[test]
-fn update_inline_rejects_conversion_to_long() {
+fn update_inline_auto_converts_to_long() {
     let key = "ro.inline.noalloc";
     let old_value = "inline";
     let new_value = "z".repeat(PROP_VALUE_MAX);
@@ -191,13 +190,12 @@ fn update_inline_rejects_conversion_to_long() {
     let before = area.get_property_info(key).unwrap().unwrap();
     assert!(!before.is_long);
 
-    let err = area.set_property(key, &new_value).unwrap_err();
-    assert!(matches!(err, PropAreaError::InPlaceUpdateTooLong { .. }));
+    // Should automatically delete+add to convert inline to long.
+    area.set_property(key, &new_value).unwrap();
 
     let after = area.get_property_info(key).unwrap().unwrap();
-    assert_eq!(after.value, old_value);
-    assert!(!after.is_long);
-    assert_eq!(after.prop_offset, before.prop_offset);
+    assert_eq!(after.value, new_value);
+    assert!(after.is_long);
 }
 
 #[test]

@@ -7,7 +7,7 @@
 use std::fs::File;
 use std::process::exit;
 
-use resetprop_rs::{PropArea, PropAreaError};
+use prop_rs::{PropArea, PropAreaError};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

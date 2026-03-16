@@ -480,7 +480,7 @@ impl fmt::Display for ContextType {
 /// # Example
 /// ```no_run
 /// use std::path::Path;
-/// use resetprop_rs::PropertyContext;
+/// use prop_rs::PropertyContext;
 ///
 /// let ctx = PropertyContext::new(
 ///     Path::new("/dev/__properties__"),

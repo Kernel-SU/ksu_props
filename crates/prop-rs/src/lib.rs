@@ -12,6 +12,7 @@ pub use prop_info::{
     PROP_VALUE_MAX,
 };
 pub use persistent_prop::{
+    check_proto, legacy_delete_prop, legacy_get_prop, legacy_list_props, legacy_set_prop,
     PersistentPropError, PersistentProperty, PersistentPropertyFile, PersistentResult,
     ANDROID_PERSISTENT_PROP_DIR, ANDROID_PERSISTENT_PROP_FILE,
 };

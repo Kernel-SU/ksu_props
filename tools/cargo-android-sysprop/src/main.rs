@@ -21,7 +21,7 @@ impl BuildProfile {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "cargo_android_sysprop",
+    name = "cargo-android-sysprop",
     about = "Build Android sysprop via cargo ndk and deploy it to /data/local/tmp via adb"
 )]
 struct Args {

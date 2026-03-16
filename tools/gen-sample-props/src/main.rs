@@ -8,7 +8,7 @@
 
 use std::fs::OpenOptions;
 
-use resetprop_rs::PropArea;
+use prop_rs::PropArea;
 
 fn main() {
     let out_path = std::env::args()

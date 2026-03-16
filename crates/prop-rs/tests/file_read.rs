@@ -11,7 +11,7 @@
 
 use std::fs::File;
 
-use resetprop_rs::PropArea;
+use prop_rs::PropArea;
 
 // ── Expected values ────────────────────────────────────────────────────────────
 // Replace these with real key-value pairs from your prop area file.

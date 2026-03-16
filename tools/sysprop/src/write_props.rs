@@ -6,7 +6,7 @@
 use std::fs::OpenOptions;
 use std::process::exit;
 
-use resetprop_rs::PropArea;
+use prop_rs::PropArea;
 
 fn parse_assignment(input: &str) -> Result<(&str, &str), &'static str> {
     let Some((key, value)) = input.split_once('=') else {

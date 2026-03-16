@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use resetprop_rs::{PropArea, PROP_VALUE_MAX};
+use prop_rs::{PropArea, PROP_VALUE_MAX};
 
 struct TempFixture {
     path: PathBuf,

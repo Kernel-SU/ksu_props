@@ -84,11 +84,13 @@ When enumerating prop-area files, the project prefers known context metadata ove
 
 The repository includes:
 
-- a reusable Rust library
-- `sysprop`: the main context-aware CLI
+- `prop-rs`: a reusable, platform-independent Rust library
+- `prop-rs-android`: Android platform bindings (bionic system property API, SELinux)
+- `sysprop`: the main context-aware CLI for offline prop-area analysis
+- `resetprop`: Android-specific CLI counterpart to Magisk's resetprop
 - `read_props`: a minimal raw prop-area reader
 - `write_props`: a minimal raw prop-area writer
-- `cargo_android_sysprop`: helper for building and pushing `sysprop` to Android via `cargo ndk` + `adb`
+- `cargo-android-sysprop`: helper for building and pushing to Android via `cargo ndk` + `adb`
 
 ### 8. Tested against synthetic and fixture-based cases
 
@@ -104,15 +106,33 @@ The test suite covers:
 
 ## Project layout
 
-- `src/lib.rs` — public library exports
-- `src/prop_area.rs` — low-level prop-area parsing, editing, scanning, compaction
-- `src/property_context.rs` — Android property-context parsing and context resolution
-- `src/persistent_prop.rs` — persistent property protobuf CRUD (no libc, pure Rust stdlib)
-- `src/bin/sysprop.rs` — main CLI
-- `src/bin/read_props.rs` — simple raw reader
-- `src/bin/write_props.rs` — simple raw writer
-- `src/bin/cargo_android_sysprop.rs` — Android build/deploy helper
-- `tests/` — integration tests and fixtures
+```
+ksu_props/
+├── crates/
+│   ├── prop-rs/                  # core library (platform-independent)
+│   │   ├── src/
+│   │   │   ├── lib.rs            — public library exports
+│   │   │   ├── prop_area.rs      — low-level prop-area parsing, editing, scanning, compaction
+│   │   │   ├── prop_info.rs      — property info types and constants
+│   │   │   ├── property_context.rs — Android property-context parsing and context resolution
+│   │   │   └── persistent_prop.rs  — persistent property protobuf CRUD (pure Rust, no libc)
+│   │   └── tests/                — integration tests and fixtures
+│   └── prop-rs-android/          # Android platform bindings (bionic dlsym, SELinux)
+│       └── src/
+│           ├── lib.rs
+│           ├── sys_prop.rs       — bionic __system_property_* API wrapper
+│           └── persist.rs        — unified persistent property API with SELinux label preservation
+├── tools/
+│   ├── sysprop/                  # platform-independent CLI (offline prop-area analysis)
+│   │   └── src/
+│   │       ├── main.rs           — main CLI with context-routed operations
+│   │       ├── read_props.rs     — simple raw reader
+│   │       └── write_props.rs    — simple raw writer
+│   ├── resetprop/                # Android-specific CLI (counterpart to Magisk's resetprop)
+│   ├── gen-sample-props/         # test fixture generator
+│   └── cargo-android-sysprop/    # build & deploy helper (cargo ndk + adb)
+└── Cargo.toml
+```
 
 ## Build
 
@@ -234,7 +254,7 @@ cargo run --bin write_props -- tests/fixtures/sample_props.prop ro.product.local
 If `cargo ndk` and `adb` are available:
 
 ```bash
-cargo run --bin cargo_android_sysprop -- --target aarch64-linux-android --profile release
+cargo run --bin cargo-android-sysprop -- --target aarch64-linux-android --profile release
 ```
 
 The helper builds `sysprop`, pushes it to the device, and marks it executable.

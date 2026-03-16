@@ -90,11 +90,13 @@ property context 解析器使用普通文件 I/O，可以直接处理从 Android
 
 仓库里同时提供：
 
-- 可复用 Rust library
-- `sysprop`：主 CLI，支持 context 路由
+- `prop-rs`：可复用的平台无关核心 Rust 库
+- `prop-rs-android`：Android 平台绑定（bionic 系统属性 API、SELinux）
+- `sysprop`：主 CLI，支持 context 路由，离线分析 prop-area
+- `resetprop`：Android 平台专用 CLI，对标 Magisk resetprop
 - `read_props`：最小原始 prop-area 读取工具
 - `write_props`：最小原始 prop-area 写入工具
-- `cargo_android_sysprop`：借助 `cargo ndk` + `adb` 构建并推送 `sysprop` 到 Android 的辅助工具
+- `cargo-android-sysprop`：借助 `cargo ndk` + `adb` 构建并推送到 Android 的辅助工具
 
 ### 8. 有真实用例测试，不只是理论支持
 
@@ -112,15 +114,33 @@ property context 解析器使用普通文件 I/O，可以直接处理从 Android
 
 ## 项目结构
 
-- `src/lib.rs` — 对外导出的库接口
-- `src/prop_area.rs` — prop-area 底层解析、修改、scan、compact
-- `src/property_context.rs` — Android property context 解析与 context 路由
-- `src/persistent_prop.rs` — persistent property protobuf 增删查改（纯 Rust stdlib，无 libc）
-- `src/bin/sysprop.rs` — 主 CLI
-- `src/bin/read_props.rs` — 简化版原始读取工具
-- `src/bin/write_props.rs` — 简化版原始写入工具
-- `src/bin/cargo_android_sysprop.rs` — Android 构建 / 推送辅助工具
-- `tests/` — 集成测试与夹具
+```
+ksu_props/
+├── crates/
+│   ├── prop-rs/                  # 核心库（平台无关）
+│   │   ├── src/
+│   │   │   ├── lib.rs            — 对外导出的库接口
+│   │   │   ├── prop_area.rs      — prop-area 底层解析、修改、scan、compact
+│   │   │   ├── prop_info.rs      — 属性信息类型与常量
+│   │   │   ├── property_context.rs — Android property context 解析与 context 路由
+│   │   │   └── persistent_prop.rs  — persistent property protobuf 增删查改（纯 Rust，无 libc）
+│   │   └── tests/                — 集成测试与夹具
+│   └── prop-rs-android/          # Android 平台绑定（bionic dlsym、SELinux）
+│       └── src/
+│           ├── lib.rs
+│           ├── sys_prop.rs       — bionic __system_property_* API 封装
+│           └── persist.rs        — 统一持久属性 API，含 SELinux 标签保持
+├── tools/
+│   ├── sysprop/                  # 平台无关 CLI（离线 prop-area 分析）
+│   │   └── src/
+│   │       ├── main.rs           — 主 CLI，支持 context 路由
+│   │       ├── read_props.rs     — 简化版原始读取工具
+│   │       └── write_props.rs    — 简化版原始写入工具
+│   ├── resetprop/                # Android 平台专用 CLI（对标 Magisk resetprop）
+│   ├── gen-sample-props/         # 测试夹具生成器
+│   └── cargo-android-sysprop/    # 构建部署辅助（cargo ndk + adb）
+└── Cargo.toml
+```
 
 ## 构建
 
@@ -242,7 +262,7 @@ cargo run --bin write_props -- tests/fixtures/sample_props.prop ro.product.local
 如果本机已经安装 `cargo ndk` 和 `adb`：
 
 ```bash
-cargo run --bin cargo_android_sysprop -- --target aarch64-linux-android --profile release
+cargo run --bin cargo-android-sysprop -- --target aarch64-linux-android --profile release
 ```
 
 这个辅助工具会完成构建、推送到设备、并设置可执行权限。

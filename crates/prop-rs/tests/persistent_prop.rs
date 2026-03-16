@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use resetprop_rs::PersistentPropertyFile;
+use prop_rs::PersistentPropertyFile;
 
 fn unique_temp_path(name: &str) -> PathBuf {
     let nonce = SystemTime::now()

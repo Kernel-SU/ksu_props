@@ -1,0 +1,13 @@
+[package]
+name = "resetprop"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "resetprop"
+path = "src/main.rs"
+
+[dependencies]
+prop-rs = { path = "../../crates/prop-rs" }
+prop-rs-android = { path = "../../crates/prop-rs-android" }
+clap = { version = "4", features = ["derive"] }
