@@ -121,6 +121,7 @@ ksu_props/
 │       └── src/
 │           ├── lib.rs
 │           ├── sys_prop.rs       — bionic __system_property_* API wrapper
+│           ├── resetprop.rs      — core resetprop operations (platform-independent business logic)
 │           └── persist.rs        — unified persistent property API with SELinux label preservation
 ├── tools/
 │   ├── sysprop/                  # platform-independent CLI (offline prop-area analysis)
@@ -233,6 +234,66 @@ You can also select an area by context name:
 ```bash
 cargo run --bin sysprop -- --props-dir <PROPS_DIR> area --context u:object_r:build_prop:s0 scan --objects
 ```
+
+## Android CLI: `resetprop`
+
+A Magisk-compatible command-line tool for manipulating Android system properties at runtime.
+Unlike the main `sysprop` CLI (which is designed for offline analysis), `resetprop` operates on a
+live Android device using bionic's `__system_property_*` API combined with direct mmap writes via `prop-rs`.
+
+```bash
+# List all properties
+resetprop
+
+# Get a property value
+resetprop ro.build.fingerprint
+
+# Set a property (goes through property_service)
+resetprop persist.sys.locale en-US
+
+# Set a property bypassing property_service (direct mmap)
+resetprop -n ro.debuggable 1
+
+# Delete a property
+resetprop -d ro.test.prop
+
+# Also operate on persistent storage (survives reboot)
+resetprop -p -n persist.sys.locale en-US
+resetprop -p -d persist.sys.locale
+
+# Read only from persistent storage
+resetprop -P persist.sys.locale
+
+# Wait for a property to exist
+resetprop -w sys.boot_completed
+
+# Wait until a property differs from a value (with timeout)
+resetprop -w sys.boot_completed 0 --timeout 30
+
+# Load properties from a file
+resetprop -f /path/to/props.txt
+
+# Compact property area memory (reclaim holes from deletions)
+resetprop -c
+
+# Show SELinux contexts
+resetprop -Z
+```
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `-n` | Skip `property_service`, force direct mmap write |
+| `-p` | Also operate on persistent property storage (`persist.*`) |
+| `-P` | Only read from persistent storage |
+| `-d` | Delete mode |
+| `-w` | Wait mode |
+| `-c` | Compact property area memory |
+| `-v` | Verbose output |
+| `-Z` | Show SELinux context instead of value |
+| `-f FILE` | Load and set properties from file |
+| `--timeout N` | Wait timeout in seconds (default: infinite) |
 
 ## Minimal tools
 

@@ -129,6 +129,7 @@ ksu_props/
 │       └── src/
 │           ├── lib.rs
 │           ├── sys_prop.rs       — bionic __system_property_* API 封装
+│           ├── resetprop.rs      — resetprop 核心操作（平台无关业务逻辑）
 │           └── persist.rs        — 统一持久属性 API，含 SELinux 标签保持
 ├── tools/
 │   ├── sysprop/                  # 平台无关 CLI（离线 prop-area 分析）
@@ -241,6 +242,64 @@ cargo run --bin sysprop -- area --path tests/fixtures/sample_props.prop compact
 ```bash
 cargo run --bin sysprop -- --props-dir <PROPS_DIR> area --context u:object_r:build_prop:s0 scan --objects
 ```
+
+## Android CLI：`resetprop`
+
+兼容 Magisk 的 Android 系统属性操作命令行工具。与主 CLI `sysprop`（用于离线分析）不同，`resetprop` 在 Android 设备上实时运行，结合 bionic 的 `__system_property_*` API 和 `prop-rs` 的直接 mmap 写入。
+
+```bash
+# 列出所有属性
+resetprop
+
+# 获取属性值
+resetprop ro.build.fingerprint
+
+# 设置属性（通过 property_service）
+resetprop persist.sys.locale en-US
+
+# 绕过 property_service 直接 mmap 写入
+resetprop -n ro.debuggable 1
+
+# 删除属性
+resetprop -d ro.test.prop
+
+# 同时操作持久存储（重启后保留）
+resetprop -p -n persist.sys.locale en-US
+resetprop -p -d persist.sys.locale
+
+# 仅从持久存储读取
+resetprop -P persist.sys.locale
+
+# 等待属性出现
+resetprop -w sys.boot_completed
+
+# 等待属性值变化（带超时）
+resetprop -w sys.boot_completed 0 --timeout 30
+
+# 从文件加载属性
+resetprop -f /path/to/props.txt
+
+# 压缩属性区内存（回收删除后的空洞）
+resetprop -c
+
+# 显示 SELinux context
+resetprop -Z
+```
+
+### 参数说明
+
+| 参数 | 说明 |
+|------|------|
+| `-n` | 跳过 `property_service`，强制直接 mmap 写入 |
+| `-p` | 同时操作持久属性存储（`persist.*`） |
+| `-P` | 仅从持久存储读取 |
+| `-d` | 删除模式 |
+| `-w` | 等待模式 |
+| `-c` | 压缩属性区内存 |
+| `-v` | 详细输出 |
+| `-Z` | 列出属性时显示 SELinux context 而非值 |
+| `-f FILE` | 从文件加载并设置属性 |
+| `--timeout N` | 等待超时秒数（默认：无限） |
 
 ## 简化工具
 
