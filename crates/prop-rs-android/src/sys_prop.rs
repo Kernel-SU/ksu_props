@@ -255,6 +255,13 @@ static PROP_CTX: OnceLock<PropertyContext> = OnceLock::new();
 static APPCOMPAT_CTX: OnceLock<Option<PropertyContext>> = OnceLock::new();
 
 const APPCOMPAT_DIR: &str = "/dev/__properties__/appcompat_override";
+const APPCOMPAT_PREFIX: &str = "ro.appcompat_override.";
+
+/// Strip the `ro.appcompat_override.` prefix if present, returning the
+/// underlying property name for lookup in the appcompat area.
+fn strip_appcompat_prefix(key: &str) -> &str {
+    key.strip_prefix(APPCOMPAT_PREFIX).unwrap_or(key)
+}
 
 fn prop_ctx() -> SysPropResult<&'static PropertyContext> {
     PROP_CTX
@@ -499,11 +506,15 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
         }
 
         // Dual-write to appcompat_override area (Android 14+).
+        // If the key has the "ro.appcompat_override." prefix, strip it so that
+        // the appcompat area stores the property under its canonical name
+        // (e.g. "ro.foo" instead of "ro.appcompat_override.ro.foo").
         if let Some(appcompat) = appcompat_ctx() {
-            let ctx_name = appcompat.get_context_for_name(key);
+            let override_key = strip_appcompat_prefix(key);
+            let ctx_name = appcompat.get_context_for_name(override_key);
             let path = appcompat.context_file_path(ctx_name);
             if let Ok(mut area) = open_area_rw(&path) {
-                let result = area.set_property_with_serial(key, value, bump);
+                let result = area.set_property_with_serial(override_key, value, bump);
                 let cursor = area.into_inner();
                 if bump {
                     if let Ok(r) = &result {
@@ -551,10 +562,11 @@ pub fn delete(key: &str) -> SysPropResult<bool> {
 
     // Dual-delete from appcompat_override area (Android 14+).
     if let Some(appcompat) = appcompat_ctx() {
-        let ctx_name = appcompat.get_context_for_name(key);
+        let override_key = strip_appcompat_prefix(key);
+        let ctx_name = appcompat.get_context_for_name(override_key);
         let path = appcompat.context_file_path(ctx_name);
         if let Ok(mut area) = open_area_rw(&path) {
-            let _ = area.delete_property(key);
+            let _ = area.delete_property(override_key);
             let cursor = area.into_inner();
             let _ = cursor.flush();
         }
