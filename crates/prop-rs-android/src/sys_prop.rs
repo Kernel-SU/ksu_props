@@ -311,16 +311,6 @@ unsafe fn wake_prop_and_area(base: *const u8, prop_offset: u32) {
     futex_wake(area_serial_ptr);
 }
 
-/// Issue a futex wake for the area serial only (e.g. after delete).
-///
-/// # Safety
-///
-/// `base` must be the start of a shared-memory prop-area mmap.
-unsafe fn wake_area_serial(base: *const u8) {
-    let area_serial_ptr = base.add(AREA_SERIAL_OFFSET as usize) as *const u32;
-    futex_wake(area_serial_ptr);
-}
-
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Load bionic symbols, initialize `PropertyContext`, and call
@@ -529,13 +519,7 @@ pub fn delete(key: &str) -> SysPropResult<bool> {
     let area_path = ctx.context_file_path(context);
     let mut area = open_area_rw(&area_path)?;
     let deleted = area.delete_property(key)?;
-    if deleted {
-        area.bump_area_serial()?;
-    }
     let cursor = area.into_inner();
-    if deleted {
-        unsafe { wake_area_serial(cursor.as_ptr()) };
-    }
     cursor.flush()?;
 
     // Dual-delete from appcompat_override area (Android 14+).
@@ -543,14 +527,8 @@ pub fn delete(key: &str) -> SysPropResult<bool> {
         let ctx_name = appcompat.get_context_for_name(key);
         let path = appcompat.context_file_path(ctx_name);
         if let Ok(mut area) = open_area_rw(&path) {
-            let del = area.delete_property(key).unwrap_or(false);
-            if del {
-                let _ = area.bump_area_serial();
-            }
+            let _ = area.delete_property(key);
             let cursor = area.into_inner();
-            if del {
-                unsafe { wake_area_serial(cursor.as_ptr()) };
-            }
             let _ = cursor.flush();
         }
     }
