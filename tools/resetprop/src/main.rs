@@ -24,13 +24,14 @@
 //!   resetprop -w name value          Wait until property differs from value
 //!
 //! Compact:
-//!   resetprop -c                     Compact property area memory
+//!   resetprop -c                     Compact all property areas
+//!   resetprop -c context             Compact only the specified SELinux context
 //!
 //! Flags:
 //!   -n          Skip property_service (force direct mmap for all properties)
 //!   -p          Also operate on persistent property storage
 //!   -P          Only read persistent properties from storage
-//!   -c          Compact property area memory
+//!   -c          Compact property area memory (optionally specify a context)
 //!   -d          Delete mode
 //!   -v          Verbose output
 //!   -w          Wait mode
@@ -90,6 +91,7 @@ struct Args {
     file: Option<String>,
 
     /// Compact property area memory (reclaim holes left by deleted properties).
+    /// Optionally pass a SELinux context name to compact only that area.
     #[arg(short = 'c', long = "compact")]
     compact: bool,
 
@@ -150,8 +152,10 @@ fn run(args: &Args, rp: &ResetProp) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // -c: compact property area memory
+    // When a positional argument is given, treat it as a SELinux context name.
     if args.compact {
-        let compacted = sys_prop::compact()?;
+        let context = args.name.as_deref();
+        let compacted = sys_prop::compact(context)?;
         if !compacted {
             if args.verbose {
                 eprintln!("resetprop: nothing to compact");

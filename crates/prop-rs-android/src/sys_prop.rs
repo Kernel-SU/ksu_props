@@ -579,33 +579,34 @@ pub fn delete(key: &str) -> SysPropResult<bool> {
     Ok(deleted)
 }
 
-/// Compact all prop area files, reclaiming holes left by deletions.
+/// Compact prop area files, reclaiming holes left by deletions.
+///
+/// When `context` is `Some`, only the prop area for that SELinux context is
+/// compacted; when `None`, all prop areas (including appcompat_override) are
+/// compacted.
 ///
 /// Returns `true` if any area was compacted.
-pub fn compact() -> SysPropResult<bool> {
+pub fn compact(context: Option<&str>) -> SysPropResult<bool> {
     let mut any_compacted = false;
 
     // Compact main property areas.
     let ctx = prop_ctx()?;
-    any_compacted |= compact_areas(ctx)?;
+    any_compacted |= compact_areas(ctx, context)?;
 
     // Compact appcompat_override areas (Android 14+).
     if let Some(appcompat) = appcompat_ctx() {
-        any_compacted |= compact_areas(appcompat)?;
+        any_compacted |= compact_areas(appcompat, context)?;
     }
 
     Ok(any_compacted)
 }
 
-fn compact_areas(ctx: &PropertyContext) -> SysPropResult<bool> {
-    let targets = ctx.prop_area_files().map_err(SysPropError::Io)?;
+fn compact_areas(ctx: &PropertyContext, filter: Option<&str>) -> SysPropResult<bool> {
     let mut any_compacted = false;
 
-    for (_context, path) in &targets {
-        let mut area = match open_area_rw(path) {
-            Ok(area) => area,
-            Err(_) => continue,
-        };
+    if let Some(context) = filter {
+        let path = ctx.context_file_path(context);
+        let mut area = open_area_rw(&path)?;
         match area.compact_allocations() {
             Ok(result) => {
                 if !matches!(result, prop_rs::CompactResult::NoHoles) {
@@ -613,7 +614,24 @@ fn compact_areas(ctx: &PropertyContext) -> SysPropResult<bool> {
                 }
                 area.into_inner().flush()?;
             }
-            Err(_) => continue,
+            Err(_) => {}
+        }
+    } else {
+        let targets = ctx.prop_area_files().map_err(SysPropError::Io)?;
+        for (_context, path) in &targets {
+            let mut area = match open_area_rw(path) {
+                Ok(area) => area,
+                Err(_) => continue,
+            };
+            match area.compact_allocations() {
+                Ok(result) => {
+                    if !matches!(result, prop_rs::CompactResult::NoHoles) {
+                        any_compacted = true;
+                    }
+                    area.into_inner().flush()?;
+                }
+                Err(_) => continue,
+            }
         }
     }
 
