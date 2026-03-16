@@ -820,16 +820,27 @@ impl<M: Read + Seek> PropArea<M> {
             return Err(PropAreaError::InvalidOffset(data_offset));
         }
 
+        // Read in chunks sized to cover typical property names and values in
+        // one or two reads.  PROP_VALUE_MAX (92) covers most inline values;
+        // names are even shorter (PROP_NAME_MAX = 32).
+        const CHUNK: u32 = PROP_VALUE_MAX as u32;
+
         let mut bytes = Vec::new();
-        for idx in 0..limit {
-            let absolute_offset = self.check_range(data_offset + idx, 1)?;
-            self.inner.seek(SeekFrom::Start(absolute_offset))?;
-            let mut byte = [0u8; 1];
-            self.inner.read_exact(&mut byte)?;
-            if byte[0] == 0 {
+        let mut cursor = 0u32;
+        while cursor < limit {
+            let remaining = limit - cursor;
+            let to_read = remaining.min(CHUNK);
+            let abs = self.check_range(data_offset + cursor, to_read)?;
+            let mut buf = vec![0u8; to_read as usize];
+            self.inner.seek(SeekFrom::Start(abs))?;
+            self.inner.read_exact(&mut buf)?;
+
+            if let Some(nul_pos) = buf.iter().position(|&b| b == 0) {
+                bytes.extend_from_slice(&buf[..nul_pos]);
                 return Ok(bytes);
             }
-            bytes.push(byte[0]);
+            bytes.extend_from_slice(&buf);
+            cursor += to_read;
         }
 
         Err(PropAreaError::Corrupted("unterminated c string"))
