@@ -1202,8 +1202,7 @@ impl<M: Read + Write + Seek> PropArea<M> {
         }
 
         self.write_inline_value_bytes(prop_offset, value)?;
-        let counter = if bump_serial { 1u32 } else { 0u32 };
-        let serial = ((value.len() as u32) << 24) | counter;
+        let serial = compose_serial(0, value.len() as u32, bump_serial, false);
         self.write_u32_data(prop_offset + PROP_SERIAL_OFFSET, serial)?;
         Ok(())
     }
@@ -1225,14 +1224,7 @@ impl<M: Read + Write + Seek> PropArea<M> {
 
         let old_serial = self.read_u32_data(prop_offset + PROP_SERIAL_OFFSET)?;
         self.write_inline_value_bytes(prop_offset, value)?;
-        let counter = if bump_serial {
-            ((old_serial & 0x00ff_ffff) + 1) & 0x00ff_ffff
-        } else {
-            // Preserve the low 24-bit counter to hide the modification from
-            // detection tools that monitor serial changes (Magisk approach).
-            old_serial & 0x00ff_ffff
-        };
-        let new_serial = ((value.len() as u32) << 24) | counter;
+        let new_serial = compose_serial(old_serial, value.len() as u32, bump_serial, false);
         self.write_u32_data(prop_offset + PROP_SERIAL_OFFSET, new_serial)?;
         Ok(new_serial)
     }
@@ -1268,14 +1260,13 @@ impl<M: Read + Write + Seek> PropArea<M> {
         self.write_bytes_data(current_offset + value.len() as u32, &[0])?;
 
         let old_serial = read_u32_at(&header, offset_of!(RawPropInfoHeader, serial));
-        let error_len = u32::try_from(LONG_LEGACY_ERROR.len())
-            .map_err(|_| PropAreaError::Corrupted("legacy error marker too long"))?;
-        let counter = if bump_serial {
-            ((old_serial & 0x00ff_ffff) + 1) & 0x00ff_ffff
-        } else {
-            old_serial & 0x00ff_ffff
-        };
-        let new_serial = (error_len << 24) | PROP_INFO_LONG_FLAG | counter;
+        let new_serial = compose_serial(
+            old_serial,
+            u32::try_from(LONG_LEGACY_ERROR.len())
+                .map_err(|_| PropAreaError::Corrupted("legacy error marker too long"))?,
+            bump_serial,
+            true,
+        );
         self.write_u32_data(prop_offset + PROP_SERIAL_OFFSET, new_serial)?;
         Ok(new_serial)
     }
@@ -1298,10 +1289,9 @@ impl<M: Read + Write + Seek> PropArea<M> {
         self.write_u32_data(prop_offset + LONG_OFFSET_IN_INFO, relative_offset)?;
         let error_len = u32::try_from(LONG_LEGACY_ERROR.len())
             .map_err(|_| PropAreaError::Corrupted("legacy error marker too long"))?;
-        let counter = if bump_serial { 1u32 } else { 0u32 };
         self.write_u32_data(
             prop_offset + PROP_SERIAL_OFFSET,
-            (error_len << 24) | PROP_INFO_LONG_FLAG | counter,
+            compose_serial(0, error_len, bump_serial, true),
         )?;
 
         self.write_bytes_data(long_value_offset, value.as_bytes())?;
@@ -1413,6 +1403,26 @@ impl<M: Read + Write + Seek> PropArea<M> {
         }
         Ok(())
     }
+}
+
+fn compose_serial(old_serial: u32, value_len: u32, bump_serial: bool, is_long: bool) -> u32 {
+    let mut serial = value_len << 24;
+    if is_long {
+        serial |= PROP_INFO_LONG_FLAG;
+    }
+
+    let counter = if bump_serial {
+        // Bionic keeps mutable-property serials clean (bit 0 clear) after the
+        // update completes. Advancing a clean serial means toggling the dirty
+        // bit in the transient state and then storing the next clean value.
+        (((old_serial & 0x00ff_ffff) | 1) + 1) & 0x00ff_ffff
+    } else {
+        // For hidden modifications preserve the existing counter but force the
+        // final state to remain clean.
+        old_serial & 0x00ff_fffe
+    };
+
+    serial | counter
 }
 
 fn read_u32_at(buf: &[u8], offset: usize) -> u32 {

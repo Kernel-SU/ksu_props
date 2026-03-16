@@ -12,7 +12,7 @@
 
 use std::ffi::{CStr, CString};
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write as IoWrite};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ use std::time::Duration;
 use memmap2::{MmapMut, MmapOptions};
 use prop_rs::{
     PropArea, PropAreaError, PropertyContext, AREA_SERIAL_OFFSET, PROP_AREA_HEADER_SIZE,
-    PROP_INFO_SERIAL_OFFSET,
+    PROP_INFO_SERIAL_OFFSET, PROP_VALUE_MAX,
 };
 
 // ── Error type ──────────────────────────────────────────────────────────────
@@ -41,6 +41,12 @@ pub enum SysPropError {
     Io(io::Error),
     /// The property key or value contains an interior NUL byte.
     InvalidCString(String),
+    /// The property value is too long for a mutable system property.
+    ValueTooLong {
+        key: String,
+        len: usize,
+        max_len: usize,
+    },
     /// A persistent-property I/O operation failed.
     Persistent(prop_rs::PersistentPropError),
 }
@@ -54,6 +60,12 @@ impl fmt::Display for SysPropError {
             Self::PropArea(e) => write!(f, "prop area error: {e}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::InvalidCString(s) => write!(f, "invalid C string: {s}"),
+            Self::ValueTooLong { key, len, max_len } => {
+                write!(
+                    f,
+                    "property value too long for mutable property {key}: {len} >= {max_len}"
+                )
+            }
             Self::Persistent(e) => write!(f, "persistent property error: {e}"),
         }
     }
@@ -256,6 +268,7 @@ static APPCOMPAT_CTX: OnceLock<Option<PropertyContext>> = OnceLock::new();
 
 const APPCOMPAT_DIR: &str = "/dev/__properties__/appcompat_override";
 const APPCOMPAT_PREFIX: &str = "ro.appcompat_override.";
+const LONG_LEGACY_ERROR: &str = "Must use __system_property_read_callback() to read";
 
 /// Strip the `ro.appcompat_override.` prefix if present, returning the
 /// underlying property name for lookup in the appcompat area.
@@ -274,6 +287,12 @@ fn prop_ctx() -> SysPropResult<&'static PropertyContext> {
 
 fn appcompat_ctx() -> Option<&'static PropertyContext> {
     APPCOMPAT_CTX.get().and_then(|opt| opt.as_ref())
+}
+
+/// Open a prop area file read-only.
+fn open_area_ro(path: &Path) -> SysPropResult<PropArea<File>> {
+    let f = File::open(path)?;
+    Ok(PropArea::new(f)?)
 }
 
 /// Open a prop area file read-write via shared mmap.
@@ -460,7 +479,12 @@ pub fn for_each(mut callback: impl FnMut(&str, &str)) {
         };
         (c.read_cb)(pi, Some(read_cb), &mut inner as *mut _ as *mut c_void);
         if let (Some(n), Some(v)) = (inner.name, inner.value) {
-            (c.cb)(&n, &v);
+            let value = if should_fallback_direct_read(&n, &v) {
+                direct_read_value(&n).unwrap_or(v)
+            } else {
+                v
+            };
+            (c.cb)(&n, &value);
         }
     }
 
@@ -482,6 +506,14 @@ pub fn for_each(mut callback: impl FnMut(&str, &str)) {
 ///   init's `property_service` socket.
 pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
     let force_skip = skip_svc || key.starts_with("ro.");
+
+    if !key.starts_with("ro.") && value.len() >= PROP_VALUE_MAX {
+        return Err(SysPropError::ValueTooLong {
+            key: key.to_owned(),
+            len: value.len(),
+            max_len: PROP_VALUE_MAX,
+        });
+    }
 
     if force_skip {
         // Direct mmap write via prop-rs.
@@ -716,47 +748,81 @@ fn make_cstring(s: &str) -> SysPropResult<CString> {
     CString::new(s).map_err(|_| SysPropError::InvalidCString(s.to_owned()))
 }
 
+fn should_fallback_direct_read(name: &str, value: &str) -> bool {
+    !name.starts_with("ro.") && value == LONG_LEGACY_ERROR
+}
+
+fn direct_read_value(name: &str) -> Option<String> {
+    let (ctx, lookup_name) = if let Some(appcompat) = appcompat_ctx() {
+        if let Some(stripped) = name.strip_prefix(APPCOMPAT_PREFIX) {
+            (appcompat, stripped)
+        } else {
+            (prop_ctx().ok()?, name)
+        }
+    } else {
+        (prop_ctx().ok()?, name)
+    };
+
+    let context = ctx.get_context_for_name(lookup_name);
+    let area_path = ctx.context_file_path(context);
+    let mut area = open_area_ro(&area_path).ok()?;
+    area.get_property(lookup_name).ok().flatten()
+}
+
 fn read_value(pi: PropInfoPtr) -> Option<String> {
     struct ValueCookie {
+        name: Option<String>,
         value: Option<String>,
     }
 
     unsafe extern "C" fn cb(
         cookie: *mut c_void,
-        _name: *const c_char,
+        name: *const c_char,
         value: *const c_char,
         _serial: u32,
     ) {
         let c = &mut *(cookie as *mut ValueCookie);
+        c.name = Some(CStr::from_ptr(name).to_string_lossy().into_owned());
         c.value = Some(CStr::from_ptr(value).to_string_lossy().into_owned());
     }
 
-    let mut cookie = ValueCookie { value: None };
+    let mut cookie = ValueCookie {
+        name: None,
+        value: None,
+    };
     unsafe {
         (api().read_callback)(pi.as_ptr(), Some(cb), &mut cookie as *mut _ as *mut c_void);
     }
-    cookie.value
+    match (cookie.name, cookie.value) {
+        (Some(name), Some(value)) if should_fallback_direct_read(&name, &value) => {
+            direct_read_value(&name).or(Some(value))
+        }
+        (_, value) => value,
+    }
 }
 
 /// Read the value and serial of a prop_info in one callback.
 fn read_value_serial(pi: PropInfoPtr, out_serial: &mut u32) -> Option<String> {
     struct Cookie {
+        name: Option<String>,
         value: Option<String>,
         serial: u32,
     }
 
     unsafe extern "C" fn cb(
         cookie: *mut c_void,
-        _name: *const c_char,
+        name: *const c_char,
         value: *const c_char,
         serial: u32,
     ) {
         let c = &mut *(cookie as *mut Cookie);
+        c.name = Some(CStr::from_ptr(name).to_string_lossy().into_owned());
         c.value = Some(CStr::from_ptr(value).to_string_lossy().into_owned());
         c.serial = serial;
     }
 
     let mut cookie = Cookie {
+        name: None,
         value: None,
         serial: 0,
     };
@@ -764,7 +830,12 @@ fn read_value_serial(pi: PropInfoPtr, out_serial: &mut u32) -> Option<String> {
         (api().read_callback)(pi.as_ptr(), Some(cb), &mut cookie as *mut _ as *mut c_void);
     }
     *out_serial = cookie.serial;
-    cookie.value
+    match (cookie.name, cookie.value) {
+        (Some(name), Some(value)) if should_fallback_direct_read(&name, &value) => {
+            direct_read_value(&name).or(Some(value))
+        }
+        (_, value) => value,
+    }
 }
 
 fn read_name_value(pi: PropInfoPtr) -> Option<(String, String)> {
@@ -791,7 +862,12 @@ fn read_name_value(pi: PropInfoPtr) -> Option<(String, String)> {
     unsafe {
         (api().read_callback)(pi.as_ptr(), Some(cb), &mut cookie as *mut _ as *mut c_void);
     }
-    Some((cookie.name?, cookie.value?))
+    let name = cookie.name?;
+    let value = cookie.value?;
+    if should_fallback_direct_read(&name, &value) {
+        return Some((name.clone(), direct_read_value(&name).unwrap_or(value)));
+    }
+    Some((name, value))
 }
 
 fn remaining_timespec(deadline: Option<std::time::Instant>) -> Option<libc::timespec> {
