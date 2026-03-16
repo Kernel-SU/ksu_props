@@ -17,8 +17,6 @@ use std::time::Duration;
 
 use prop_rs::{PersistentPropError, PROP_VALUE_MAX};
 
-use crate::persist;
-
 // ── Error type ──────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -102,6 +100,7 @@ type FnUpdate = unsafe extern "C" fn(*const c_void, *const c_char, c_uint) -> c_
 type FnDel = unsafe extern "C" fn(*const c_void) -> c_int;
 type FnSerial = unsafe extern "C" fn(*const c_void) -> u32;
 type FnAreaSerial = unsafe extern "C" fn() -> u32;
+type FnGetContext = unsafe extern "C" fn(*const c_char) -> *const c_char;
 type FnWait = unsafe extern "C" fn(
     *const c_void,         // pi (null = global)
     u32,                   // old serial
@@ -124,6 +123,7 @@ struct BionicApi {
     del: Option<FnDel>,
     area_serial: Option<FnAreaSerial>,
     wait: Option<FnWait>,
+    get_context: Option<FnGetContext>,
 }
 
 static API: OnceLock<BionicApi> = OnceLock::new();
@@ -170,6 +170,7 @@ pub fn init() -> SysPropResult<()> {
         del: load_sym("__system_property_del"),
         area_serial: load_sym("__system_property_area_serial"),
         wait: load_sym("__system_property_wait"),
+        get_context: load_sym("__system_property_get_context"),
     };
 
     let ret = unsafe { init_fn() };
@@ -211,6 +212,23 @@ pub fn serial(pi: PropInfoPtr) -> u32 {
 /// Get the global area serial (if available).
 pub fn area_serial() -> Option<u32> {
     api().area_serial.map(|f| unsafe { f() })
+}
+
+/// Get the SELinux context of a property by name.
+///
+/// Requires `__system_property_get_context` (available on Magisk-patched bionic).
+/// Returns `None` if the symbol is unavailable or the key contains a NUL byte.
+pub fn get_context(key: &str) -> SysPropResult<String> {
+    let get_ctx = api()
+        .get_context
+        .ok_or(SysPropError::SymbolNotFound("__system_property_get_context"))?;
+    let ckey = make_cstring(key)?;
+    let ptr = unsafe { get_ctx(ckey.as_ptr()) };
+    if ptr.is_null() {
+        Ok(String::new())
+    } else {
+        Ok(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+    }
 }
 
 /// Iterate over all properties.
@@ -325,43 +343,39 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
         }
     }
 
-    // Manually persist when bypassing property_service.
-    if force_skip && key.starts_with("persist.") {
-        persist::persist_set_prop(key, value)?;
-    }
-
     Ok(())
 }
 
-/// Delete a property.
+/// Delete a property from shared memory.
 ///
 /// Requires Magisk's patched bionic which provides `__system_property_del`.
 /// On stock bionic, this returns `SysPropError::DeleteUnavailable`.
-pub fn delete(key: &str, persist: bool) -> SysPropResult<bool> {
+///
+/// This does **not** touch persistent storage — the caller is responsible
+/// for calling `persist::persist_delete_prop` when appropriate.
+pub fn delete(key: &str) -> SysPropResult<bool> {
     let pi = match find(key) {
         Some(pi) => pi,
         None => return Ok(false),
     };
 
     delete_internal(pi)?;
-
-    if persist && key.starts_with("persist.") {
-        persist::persist_delete_prop(key)?;
-    }
-
     Ok(true)
 }
 
-/// Wait for a property to exist or reach a specific value.
+/// Wait for a property to exist or change away from a given value.
 ///
-/// - `expected_value = None`: wait until the property exists.
-/// - `expected_value = Some(v)`: wait until the property equals `v`.
+/// Follows Magisk resetprop semantics:
+/// - `old_value = None`: wait until the property exists, then return.
+/// - `old_value = Some(v)`: if the current value already differs from `v`,
+///   return immediately; otherwise wait until the value changes to something
+///   other than `v`.
 /// - `timeout = None`: wait indefinitely.
 ///
 /// Returns `true` if the condition was met, `false` on timeout.
 pub fn wait(
     key: &str,
-    expected_value: Option<&str>,
+    old_value: Option<&str>,
     timeout: Option<Duration>,
 ) -> SysPropResult<bool> {
     let wait_fn = api()
@@ -370,6 +384,34 @@ pub fn wait(
 
     let deadline = timeout.map(|d| std::time::Instant::now() + d);
 
+    // Phase 1: wait for the property to exist.
+    let info = loop {
+        if let Some(dl) = deadline {
+            if std::time::Instant::now() >= dl {
+                return Ok(false);
+            }
+        }
+
+        if let Some(pi) = find(key) {
+            break pi;
+        }
+
+        // Property doesn't exist — wait for global area serial change.
+        let old = area_serial().unwrap_or(0);
+        let mut new_serial = 0u32;
+        let ts = remaining_timespec(deadline);
+        unsafe {
+            wait_fn(std::ptr::null(), old, &mut new_serial, ts_ptr(&ts));
+        }
+    };
+
+    // If no old_value specified, property existence is sufficient.
+    let old_value = match old_value {
+        Some(v) => v,
+        None => return Ok(true),
+    };
+
+    // Phase 2: wait for value != old_value.
     loop {
         if let Some(dl) = deadline {
             if std::time::Instant::now() >= dl {
@@ -377,41 +419,18 @@ pub fn wait(
             }
         }
 
-        let pi = find(key);
-
-        match (pi, expected_value) {
-            (Some(info), Some(expected)) => {
-                if let Some(current) = read_value(info) {
-                    if current == expected {
-                        return Ok(true);
-                    }
-                }
-                // Wait for this property's serial to change.
-                let old_serial = serial(info);
-                let mut new_serial = 0u32;
-                let ts = remaining_timespec(deadline);
-                unsafe {
-                    wait_fn(info.as_ptr(), old_serial, &mut new_serial, ts_ptr(&ts));
-                }
-            }
-            (Some(_), None) => {
-                // Property exists — done.
+        let mut curr_serial = 0u32;
+        if let Some(current) = read_value_serial(info, &mut curr_serial) {
+            if current != old_value {
                 return Ok(true);
             }
-            (None, _) => {
-                // Property doesn't exist — wait for global area serial change.
-                let old = area_serial().unwrap_or(0);
-                let mut new_serial = 0u32;
-                let ts = remaining_timespec(deadline);
-                unsafe {
-                    wait_fn(
-                        std::ptr::null(),
-                        old,
-                        &mut new_serial,
-                        ts_ptr(&ts),
-                    );
-                }
-            }
+        }
+
+        // Current value still equals old_value — wait for serial change.
+        let mut new_serial = 0u32;
+        let ts = remaining_timespec(deadline);
+        unsafe {
+            wait_fn(info.as_ptr(), curr_serial, &mut new_serial, ts_ptr(&ts));
         }
     }
 }
@@ -441,6 +460,35 @@ fn read_value(pi: PropInfoPtr) -> Option<String> {
     unsafe {
         (api().read_callback)(pi.as_ptr(), Some(cb), &mut cookie as *mut _ as *mut c_void);
     }
+    cookie.value
+}
+
+/// Read the value and serial of a prop_info in one callback.
+fn read_value_serial(pi: PropInfoPtr, out_serial: &mut u32) -> Option<String> {
+    struct Cookie {
+        value: Option<String>,
+        serial: u32,
+    }
+
+    unsafe extern "C" fn cb(
+        cookie: *mut c_void,
+        _name: *const c_char,
+        value: *const c_char,
+        serial: u32,
+    ) {
+        let c = &mut *(cookie as *mut Cookie);
+        c.value = Some(CStr::from_ptr(value).to_string_lossy().into_owned());
+        c.serial = serial;
+    }
+
+    let mut cookie = Cookie {
+        value: None,
+        serial: 0,
+    };
+    unsafe {
+        (api().read_callback)(pi.as_ptr(), Some(cb), &mut cookie as *mut _ as *mut c_void);
+    }
+    *out_serial = cookie.serial;
     cookie.value
 }
 
