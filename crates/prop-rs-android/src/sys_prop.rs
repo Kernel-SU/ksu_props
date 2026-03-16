@@ -15,7 +15,7 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write as IoWrite};
 use std::os::raw::{c_char, c_int, c_void};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -238,9 +238,15 @@ impl IoWrite for MmapCursor {
     }
 }
 
-// ── PropertyContext singleton ────────────────────────────────────────────────
+// ── PropertyContext singletons ───────────────────────────────────────────────
 
 static PROP_CTX: OnceLock<PropertyContext> = OnceLock::new();
+
+/// Appcompat override context for Android 14+ dual-write support.
+/// `None` when the appcompat_override directory does not exist.
+static APPCOMPAT_CTX: OnceLock<Option<PropertyContext>> = OnceLock::new();
+
+const APPCOMPAT_DIR: &str = "/dev/__properties__/appcompat_override";
 
 fn prop_ctx() -> SysPropResult<&'static PropertyContext> {
     PROP_CTX
@@ -249,6 +255,10 @@ fn prop_ctx() -> SysPropResult<&'static PropertyContext> {
             io::ErrorKind::NotFound,
             "PropertyContext not initialized — call sys_prop::init() first",
         )))
+}
+
+fn appcompat_ctx() -> Option<&'static PropertyContext> {
+    APPCOMPAT_CTX.get().and_then(|opt| opt.as_ref())
 }
 
 /// Open a prop area file read-write via shared mmap.
@@ -296,6 +306,16 @@ pub fn init() -> SysPropResult<()> {
             Some(Path::new("/")),
         )
         .expect("failed to load PropertyContext from /dev/__properties__")
+    });
+
+    // Initialize appcompat_override context (Android 14+).
+    // Silently set to None when the directory does not exist.
+    let _ = APPCOMPAT_CTX.get_or_init(|| {
+        let dir = PathBuf::from(APPCOMPAT_DIR);
+        if !dir.is_dir() {
+            return None;
+        }
+        PropertyContext::new(&dir, Some(Path::new("/"))).ok()
     });
 
     Ok(())
@@ -406,6 +426,16 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
         let mut area = open_area_rw(&area_path)?;
         area.set_property(key, value)?;
         area.into_inner().flush()?;
+
+        // Dual-write to appcompat_override area (Android 14+).
+        if let Some(appcompat) = appcompat_ctx() {
+            let ctx_name = appcompat.get_context_for_name(key);
+            let path = appcompat.context_file_path(ctx_name);
+            if let Ok(mut area) = open_area_rw(&path) {
+                let _ = area.set_property(key, value);
+                let _ = area.into_inner().flush();
+            }
+        }
     } else {
         // Go through bionic's property_service socket.
         let ckey = make_cstring(key)?;
@@ -432,6 +462,17 @@ pub fn delete(key: &str) -> SysPropResult<bool> {
     let mut area = open_area_rw(&area_path)?;
     let deleted = area.delete_property(key)?;
     area.into_inner().flush()?;
+
+    // Dual-delete from appcompat_override area (Android 14+).
+    if let Some(appcompat) = appcompat_ctx() {
+        let ctx_name = appcompat.get_context_for_name(key);
+        let path = appcompat.context_file_path(ctx_name);
+        if let Ok(mut area) = open_area_rw(&path) {
+            let _ = area.delete_property(key);
+            let _ = area.into_inner().flush();
+        }
+    }
+
     Ok(deleted)
 }
 
@@ -439,14 +480,28 @@ pub fn delete(key: &str) -> SysPropResult<bool> {
 ///
 /// Returns `true` if any area was compacted.
 pub fn compact() -> SysPropResult<bool> {
+    let mut any_compacted = false;
+
+    // Compact main property areas.
     let ctx = prop_ctx()?;
+    any_compacted |= compact_areas(ctx)?;
+
+    // Compact appcompat_override areas (Android 14+).
+    if let Some(appcompat) = appcompat_ctx() {
+        any_compacted |= compact_areas(appcompat)?;
+    }
+
+    Ok(any_compacted)
+}
+
+fn compact_areas(ctx: &PropertyContext) -> SysPropResult<bool> {
     let targets = ctx.prop_area_files().map_err(SysPropError::Io)?;
     let mut any_compacted = false;
 
     for (_context, path) in &targets {
         let mut area = match open_area_rw(path) {
             Ok(area) => area,
-            Err(_) => continue, // skip inaccessible areas
+            Err(_) => continue,
         };
         match area.compact_allocations() {
             Ok(result) => {
