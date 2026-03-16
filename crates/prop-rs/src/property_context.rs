@@ -26,16 +26,16 @@ use std::path::{Path, PathBuf};
 // ────────────────────────────────────────────────────────────────────────────
 
 #[inline]
-fn read_u32(data: &[u8], offset: usize) -> u32 {
-    let b: [u8; 4] = data[offset..offset + 4].try_into().expect("read_u32 oob");
-    u32::from_ne_bytes(b)
+fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let b: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
+    Some(u32::from_ne_bytes(b))
 }
 
 /// Read a null-terminated C string from `data` starting at `offset`.
-fn read_cstr(data: &[u8], offset: usize) -> &str {
-    let slice = &data[offset..];
+fn read_cstr(data: &[u8], offset: usize) -> Option<&str> {
+    let slice = data.get(offset..)?;
     let len = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
-    std::str::from_utf8(&slice[..len]).unwrap_or("")
+    std::str::from_utf8(&slice[..len]).ok()
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -86,7 +86,9 @@ impl SerializedContext {
                 "property_info file too small",
             ));
         }
-        let min_ver = read_u32(&data, 4);
+        let min_ver = read_u32(&data, 4).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "property_info header truncated")
+        })?;
         if min_ver > SUPPORTED_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -100,81 +102,101 @@ impl SerializedContext {
 
     // ── Header accessors ─────────────────────────────────────────────────────
 
-    fn current_version(&self) -> u32 { read_u32(&self.data, 0) }
-    fn _size(&self) -> usize { read_u32(&self.data, 8) as usize }
-    fn contexts_offset(&self) -> usize { read_u32(&self.data, 12) as usize }
-    fn types_offset(&self) -> usize { read_u32(&self.data, 16) as usize }
-    fn root_offset(&self) -> usize { read_u32(&self.data, 20) as usize }
+    fn current_version(&self) -> u32 { read_u32(&self.data, 0).unwrap_or(0) }
+    fn _size(&self) -> usize { read_u32(&self.data, 8).unwrap_or(0) as usize }
+    fn contexts_offset(&self) -> Option<usize> {
+        let off = read_u32(&self.data, 12)? as usize;
+        if off < self.data.len() { Some(off) } else { None }
+    }
+    fn types_offset(&self) -> Option<usize> {
+        let off = read_u32(&self.data, 16)? as usize;
+        if off < self.data.len() { Some(off) } else { None }
+    }
+    fn root_offset(&self) -> Option<usize> {
+        let off = read_u32(&self.data, 20)? as usize;
+        // root node needs at least 28 bytes (TrieNodeInternal)
+        if off + 28 <= self.data.len() { Some(off) } else { None }
+    }
 
     // ── Context / type tables ─────────────────────────────────────────────────
 
     pub fn num_contexts(&self) -> usize {
-        read_u32(&self.data, self.contexts_offset()) as usize
+        self.contexts_offset()
+            .and_then(|off| read_u32(&self.data, off))
+            .unwrap_or(0) as usize
     }
 
-    pub fn context(&self, index: usize) -> &str {
-        let arr_off = self.contexts_offset() + 4;
-        let str_off = read_u32(&self.data, arr_off + index * 4) as usize;
+    pub fn context(&self, index: usize) -> Option<&str> {
+        let ctx_off = self.contexts_offset()?;
+        let arr_off = ctx_off.checked_add(4)?;
+        let str_off = read_u32(&self.data, arr_off.checked_add(index.checked_mul(4)?)?)? as usize;
         read_cstr(&self.data, str_off)
     }
 
     pub fn num_types(&self) -> usize {
-        read_u32(&self.data, self.types_offset()) as usize
+        self.types_offset()
+            .and_then(|off| read_u32(&self.data, off))
+            .unwrap_or(0) as usize
     }
 
-    pub fn type_str(&self, index: usize) -> &str {
-        let arr_off = self.types_offset() + 4;
-        let str_off = read_u32(&self.data, arr_off + index * 4) as usize;
+    pub fn type_str(&self, index: usize) -> Option<&str> {
+        let typ_off = self.types_offset()?;
+        let arr_off = typ_off.checked_add(4)?;
+        let str_off = read_u32(&self.data, arr_off.checked_add(index.checked_mul(4)?)?)? as usize;
         read_cstr(&self.data, str_off)
     }
 
     // ── TrieNodeInternal accessors (by node byte offset) ─────────────────────
 
-    fn node_pe_offset(&self, node_off: usize) -> usize {
-        read_u32(&self.data, node_off) as usize
+    fn node_pe_offset(&self, node_off: usize) -> Option<usize> {
+        Some(read_u32(&self.data, node_off)? as usize)
     }
 
     /// Context index stored in the PropertyEntry attached to this trie node.
-    fn node_context_index(&self, node_off: usize) -> u32 {
-        let pe = self.node_pe_offset(node_off);
-        read_u32(&self.data, pe + 8)
+    fn node_context_index(&self, node_off: usize) -> Option<u32> {
+        let pe = self.node_pe_offset(node_off)?;
+        read_u32(&self.data, pe.checked_add(8)?)
     }
 
     fn node_num_children(&self, node_off: usize) -> usize {
-        read_u32(&self.data, node_off + 4) as usize
+        read_u32(&self.data, node_off + 4).unwrap_or(0) as usize
     }
 
-    fn node_child_arr_off(&self, node_off: usize) -> usize {
-        read_u32(&self.data, node_off + 8) as usize
+    fn node_child_arr_off(&self, node_off: usize) -> Option<usize> {
+        Some(read_u32(&self.data, node_off.checked_add(8)?)? as usize)
     }
 
     /// Byte offset of the i-th child TrieNodeInternal.
-    fn node_child_offset(&self, node_off: usize, i: usize) -> usize {
-        let arr = self.node_child_arr_off(node_off);
-        read_u32(&self.data, arr + i * 4) as usize
+    fn node_child_offset(&self, node_off: usize, i: usize) -> Option<usize> {
+        let arr = self.node_child_arr_off(node_off)?;
+        Some(read_u32(&self.data, arr.checked_add(i.checked_mul(4)?)?)? as usize)
     }
 
     /// Name string of a child node (the trie segment, e.g. "ro", "persist").
-    fn node_child_name(&self, child_off: usize) -> &str {
-        let pe = self.node_pe_offset(child_off);
-        let name_off = read_u32(&self.data, pe) as usize;
+    fn node_child_name(&self, child_off: usize) -> Option<&str> {
+        let pe = self.node_pe_offset(child_off)?;
+        let name_off = read_u32(&self.data, pe)? as usize;
         read_cstr(&self.data, name_off)
     }
 
     fn node_num_prefixes(&self, node_off: usize) -> usize {
-        read_u32(&self.data, node_off + 12) as usize
+        node_off.checked_add(12)
+            .and_then(|off| read_u32(&self.data, off))
+            .unwrap_or(0) as usize
     }
 
-    fn node_prefix_arr_off(&self, node_off: usize) -> usize {
-        read_u32(&self.data, node_off + 16) as usize
+    fn node_prefix_arr_off(&self, node_off: usize) -> Option<usize> {
+        Some(read_u32(&self.data, node_off.checked_add(16)?)? as usize)
     }
 
     fn node_num_exact_matches(&self, node_off: usize) -> usize {
-        read_u32(&self.data, node_off + 20) as usize
+        node_off.checked_add(20)
+            .and_then(|off| read_u32(&self.data, off))
+            .unwrap_or(0) as usize
     }
 
-    fn node_exact_arr_off(&self, node_off: usize) -> usize {
-        read_u32(&self.data, node_off + 24) as usize
+    fn node_exact_arr_off(&self, node_off: usize) -> Option<usize> {
+        Some(read_u32(&self.data, node_off.checked_add(24)?)? as usize)
     }
 
     // ── Trie traversal ────────────────────────────────────────────────────────
@@ -187,19 +209,32 @@ impl SerializedContext {
         if n == 0 {
             return;
         }
-        let arr_off = self.node_prefix_arr_off(node_off);
+        let arr_off = match self.node_prefix_arr_off(node_off) {
+            Some(off) => off,
+            None => return,
+        };
         let rem_bytes = remaining.as_bytes();
 
         for i in 0..n {
-            let pe_off = read_u32(&self.data, arr_off + i * 4) as usize;
-            let name_off = read_u32(&self.data, pe_off) as usize;
-            let prefix_len = read_u32(&self.data, pe_off + 4) as usize;
-            let ctx = read_u32(&self.data, pe_off + 8);
+            let Some(pe_off) = read_u32(&self.data, arr_off + i * 4).map(|v| v as usize) else {
+                return;
+            };
+            let Some(name_off) = read_u32(&self.data, pe_off).map(|v| v as usize) else {
+                return;
+            };
+            let Some(prefix_len) = read_u32(&self.data, pe_off + 4).map(|v| v as usize) else {
+                return;
+            };
+            let Some(ctx) = read_u32(&self.data, pe_off + 8) else {
+                return;
+            };
 
             if prefix_len > rem_bytes.len() {
                 continue;
             }
-            let prefix_bytes = &self.data[name_off..name_off + prefix_len];
+            let Some(prefix_bytes) = self.data.get(name_off..name_off + prefix_len) else {
+                return;
+            };
             if rem_bytes[..prefix_len] == *prefix_bytes {
                 if ctx != !0u32 {
                     *ctx_idx = ctx;
@@ -225,8 +260,8 @@ impl SerializedContext {
         let mut hi = n as i32 - 1;
         while lo <= hi {
             let mid = (lo + hi) / 2;
-            let child_off = self.node_child_offset(node_off, mid as usize);
-            let child_name = self.node_child_name(child_off);
+            let child_off = self.node_child_offset(node_off, mid as usize)?;
+            let child_name = self.node_child_name(child_off)?;
             let cmp = strncmp_piece(child_name.as_bytes(), piece_bytes, plen);
             match cmp {
                 0 => return Some(child_off),
@@ -241,11 +276,11 @@ impl SerializedContext {
     fn get_context_index(&self, name: &str) -> Option<usize> {
         let mut ctx_idx: u32 = !0u32;
         let mut remaining = name;
-        let mut node_off = self.root_offset();
+        let mut node_off = self.root_offset()?;
 
         loop {
             // Apply context provided by current trie node.
-            let node_ctx = self.node_context_index(node_off);
+            let node_ctx = self.node_context_index(node_off).unwrap_or(!0u32);
             if node_ctx != !0u32 {
                 ctx_idx = node_ctx;
             }
@@ -269,13 +304,13 @@ impl SerializedContext {
         // Check exact matches at the leaf.
         let n_exact = self.node_num_exact_matches(node_off);
         if n_exact > 0 {
-            let arr_off = self.node_exact_arr_off(node_off);
+            let arr_off = self.node_exact_arr_off(node_off)?;
             for i in 0..n_exact {
-                let pe_off = read_u32(&self.data, arr_off + i * 4) as usize;
-                let name_off = read_u32(&self.data, pe_off) as usize;
-                let exact_name = read_cstr(&self.data, name_off);
+                let pe_off = read_u32(&self.data, arr_off + i * 4)? as usize;
+                let name_off = read_u32(&self.data, pe_off)? as usize;
+                let exact_name = read_cstr(&self.data, name_off)?;
                 if exact_name == remaining {
-                    let ctx = read_u32(&self.data, pe_off + 8);
+                    let ctx = read_u32(&self.data, pe_off + 8)?;
                     if ctx != !0u32 {
                         ctx_idx = ctx;
                     }
@@ -293,8 +328,8 @@ impl SerializedContext {
 
     pub fn get_context_for_name(&self, name: &str) -> &str {
         match self.get_context_index(name) {
-            Some(idx) if idx < self.num_contexts() => self.context(idx),
-            _ => "u:object_r:default_prop:s0",
+            Some(idx) => self.context(idx).unwrap_or(DEFAULT_CONTEXT),
+            _ => DEFAULT_CONTEXT,
         }
     }
 }
@@ -430,7 +465,7 @@ impl SplitContext {
                 return &entry.context;
             }
         }
-        "u:object_r:default_prop:s0"
+        DEFAULT_CONTEXT
     }
 }
 
@@ -440,6 +475,9 @@ impl SplitContext {
 
 /// Context returned for all properties in the PreSplit layout.
 const PRE_SPLIT_CONTEXT: &str = "u:object_r:properties_device:s0";
+
+/// Default fallback context when no match is found.
+const DEFAULT_CONTEXT: &str = "u:object_r:default_prop:s0";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Public API
@@ -568,11 +606,15 @@ impl PropertyContext {
                 println!("  parser version : {}", sc.current_version());
                 println!("  contexts ({}):", sc.num_contexts());
                 for i in 0..sc.num_contexts() {
-                    println!("    [{:3}] {}", i, sc.context(i));
+                    if let Some(ctx) = sc.context(i) {
+                        println!("    [{:3}] {}", i, ctx);
+                    }
                 }
                 println!("  types ({}):", sc.num_types());
                 for i in 0..sc.num_types() {
-                    println!("    [{:3}] {}", i, sc.type_str(i));
+                    if let Some(t) = sc.type_str(i) {
+                        println!("    [{:3}] {}", i, t);
+                    }
                 }
             }
             ContextStorage::Split(sc) => {
@@ -608,7 +650,9 @@ impl PropertyContext {
     pub fn list_all_contexts(&self) -> Vec<&str> {
         match &self.storage {
             ContextStorage::Serialized(sc) => {
-                (0..sc.num_contexts()).map(|i| sc.context(i)).collect()
+                (0..sc.num_contexts())
+                    .filter_map(|i| sc.context(i))
+                    .collect()
             }
             ContextStorage::Split(sc) => {
                 let mut seen = std::collections::BTreeSet::new();
