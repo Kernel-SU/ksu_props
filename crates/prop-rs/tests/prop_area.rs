@@ -116,7 +116,10 @@ fn update_inline_keeps_serial_and_clears_trailing_bytes() {
 
     let raw_after = area.into_inner().into_inner();
     let serial_after = read_serial(&raw_after, after.prop_offset);
-    assert_eq!(serial_after, serial_before);
+    // High 8 bits encode new value length; low 24 bits preserved from original
+    // serial to hide modification traces (Magisk-compatible behaviour).
+    let expected_serial = ((new_value.len() as u32) << 24) | (serial_before & 0x00ff_ffff);
+    assert_eq!(serial_after, expected_serial);
 
     let value_abs = data_abs(after.value_offset);
     assert_eq!(&raw_after[value_abs..value_abs + new_value.len()], new_value.as_bytes());

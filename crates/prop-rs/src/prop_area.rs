@@ -1144,7 +1144,14 @@ impl<M: Read + Write + Seek> PropArea<M> {
             });
         }
 
-        self.write_inline_value_bytes(prop_offset, value)
+        // Read old serial to preserve the low 24-bit counter (à la Magisk).
+        // This hides the modification from detection tools that monitor serial
+        // changes.  Only the length field (high 8 bits) is updated.
+        let old_serial = self.read_u32_data(prop_offset + PROP_SERIAL_OFFSET)?;
+        self.write_inline_value_bytes(prop_offset, value)?;
+        let new_serial = ((value.len() as u32) << 24) | (old_serial & 0x00ff_ffff);
+        self.write_u32_data(prop_offset + PROP_SERIAL_OFFSET, new_serial)?;
+        Ok(())
     }
 
     fn update_long_property(&mut self, prop_offset: u32, name: &str, value: &str) -> Result<()> {
@@ -1170,6 +1177,15 @@ impl<M: Read + Write + Seek> PropArea<M> {
         self.zero_data(current_offset, current_capacity)?;
         self.write_bytes_data(current_offset, value.as_bytes())?;
         self.write_bytes_data(current_offset + value.len() as u32, &[0])?;
+
+        // Preserve the low 24-bit serial counter to hide modification traces
+        // (same approach as Magisk).  The long flag and error_len in the high
+        // bits are kept as-is since the legacy error marker doesn't change.
+        let old_serial = read_u32_at(&header, offset_of!(RawPropInfoHeader, serial));
+        let error_len = u32::try_from(LONG_LEGACY_ERROR.len())
+            .map_err(|_| PropAreaError::Corrupted("legacy error marker too long"))?;
+        let new_serial = (error_len << 24) | PROP_INFO_LONG_FLAG | (old_serial & 0x00ff_ffff);
+        self.write_u32_data(prop_offset + PROP_SERIAL_OFFSET, new_serial)?;
         Ok(())
     }
 
