@@ -23,10 +23,14 @@
 //!   resetprop -w name                Wait for property to exist
 //!   resetprop -w name value          Wait until property differs from value
 //!
+//! Compact:
+//!   resetprop -c                     Compact property area memory
+//!
 //! Flags:
 //!   -n          Skip property_service (force direct mmap for all properties)
 //!   -p          Also operate on persistent property storage
 //!   -P          Only read persistent properties from storage
+//!   -c          Compact property area memory
 //!   -d          Delete mode
 //!   -v          Verbose output
 //!   -w          Wait mode
@@ -85,6 +89,10 @@ struct Args {
     #[arg(short = 'f', long = "file")]
     file: Option<String>,
 
+    /// Compact property area memory (reclaim holes left by deleted properties).
+    #[arg(short = 'c', long = "compact")]
+    compact: bool,
+
     /// Show SELinux context when listing properties.
     #[arg(short = 'Z')]
     show_context: bool,
@@ -120,7 +128,8 @@ fn main() {
 
 fn run(args: &Args, rp: &ResetProp) -> Result<(), Box<dyn std::error::Error>> {
     // Validate: at most one special mode.
-    let special_modes = args.wait as u8 + args.delete as u8 + args.file.is_some() as u8;
+    let special_modes =
+        args.wait as u8 + args.delete as u8 + args.compact as u8 + args.file.is_some() as u8;
     if special_modes > 1 {
         return Err("multiple operation modes detected".into());
     }
@@ -136,6 +145,18 @@ fn run(args: &Args, rp: &ResetProp) -> Result<(), Box<dyn std::error::Error>> {
         if !ok {
             eprintln!("resetprop: timeout waiting for {name}");
             process::exit(2);
+        }
+        return Ok(());
+    }
+
+    // -c: compact property area memory
+    if args.compact {
+        let compacted = sys_prop::compact()?;
+        if !compacted {
+            if args.verbose {
+                eprintln!("resetprop: nothing to compact");
+            }
+            process::exit(1);
         }
         return Ok(());
     }
