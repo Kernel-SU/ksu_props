@@ -903,9 +903,6 @@ impl<M: Read + Write + Seek> PropArea<M> {
             let new_prop_offset = self.create_prop_info(key, value, bump_serial)?;
             self.write_u32_data(node_offset + NODE_PROP_OFFSET, new_prop_offset)?;
             let serial = self.read_u32_data(new_prop_offset + PROP_SERIAL_OFFSET)?;
-            if bump_serial {
-                self.bump_area_serial()?;
-            }
             return Ok(PropWriteResult {
                 prop_offset: new_prop_offset,
                 serial,
@@ -921,16 +918,11 @@ impl<M: Read + Write + Seek> PropArea<M> {
         };
 
         match result {
-            Ok(serial) => {
-                if bump_serial {
-                    self.bump_area_serial()?;
-                }
-                Ok(PropWriteResult {
-                    prop_offset,
-                    serial,
-                    created: false,
-                })
-            }
+            Ok(serial) => Ok(PropWriteResult {
+                prop_offset,
+                serial,
+                created: false,
+            }),
             Err(PropAreaError::InPlaceUpdateTooLong { .. }) => {
                 // Value doesn't fit in the current slot (inline → long, or
                 // long value grew beyond its allocation).  Delete without
@@ -941,9 +933,6 @@ impl<M: Read + Write + Seek> PropArea<M> {
                 let new_prop_offset = self.create_prop_info(key, value, bump_serial)?;
                 self.write_u32_data(node_offset + NODE_PROP_OFFSET, new_prop_offset)?;
                 let serial = self.read_u32_data(new_prop_offset + PROP_SERIAL_OFFSET)?;
-                if bump_serial {
-                    self.bump_area_serial()?;
-                }
                 Ok(PropWriteResult {
                     prop_offset: new_prop_offset,
                     serial,

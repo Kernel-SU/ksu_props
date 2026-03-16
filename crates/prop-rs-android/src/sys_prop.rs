@@ -294,21 +294,36 @@ unsafe fn futex_wake(addr: *const u32) {
     );
 }
 
-/// Issue futex wakes for a prop serial and the area serial on a mapped
-/// prop-area.
+/// Issue a futex wake for a prop's serial on a mapped prop-area.
 ///
 /// # Safety
 ///
 /// `base` must be the start of a shared-memory prop-area mmap.
-unsafe fn wake_prop_and_area(base: *const u8, prop_offset: u32) {
+unsafe fn wake_prop_serial(base: *const u8, prop_offset: u32) {
     let prop_serial_ptr = base
         .add(PROP_AREA_HEADER_SIZE as usize)
         .add(prop_offset as usize)
         .add(PROP_INFO_SERIAL_OFFSET as usize) as *const u32;
     futex_wake(prop_serial_ptr);
+}
 
-    let area_serial_ptr = base.add(AREA_SERIAL_OFFSET as usize) as *const u32;
-    futex_wake(area_serial_ptr);
+/// Bump the global `properties_serial` area serial and issue a futex wake.
+///
+/// In bionic, this is the serial returned by `__system_property_area_serial()`
+/// and waited on by `__system_property_wait(NULL, ...)`.  It lives in a
+/// **separate** prop-area file (`properties_serial`), not in the prop-area
+/// that contains the property being modified.
+fn bump_and_wake_global_serial(ctx: &PropertyContext) -> SysPropResult<()> {
+    let serial_path = ctx.serial_prop_area_path();
+    let mut serial_area = open_area_rw(&serial_path)?;
+    serial_area.bump_area_serial()?;
+    let cursor = serial_area.into_inner();
+    unsafe {
+        let serial_ptr = cursor.as_ptr().add(AREA_SERIAL_OFFSET as usize) as *const u32;
+        futex_wake(serial_ptr);
+    }
+    cursor.flush()?;
+    Ok(())
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -475,9 +490,13 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
         let result = area.set_property_with_serial(key, value, bump)?;
         let cursor = area.into_inner();
         if bump {
-            unsafe { wake_prop_and_area(cursor.as_ptr(), result.prop_offset) };
+            unsafe { wake_prop_serial(cursor.as_ptr(), result.prop_offset) };
         }
         cursor.flush()?;
+
+        if bump {
+            bump_and_wake_global_serial(ctx)?;
+        }
 
         // Dual-write to appcompat_override area (Android 14+).
         if let Some(appcompat) = appcompat_ctx() {
@@ -488,10 +507,14 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
                 let cursor = area.into_inner();
                 if bump {
                     if let Ok(r) = &result {
-                        unsafe { wake_prop_and_area(cursor.as_ptr(), r.prop_offset) };
+                        unsafe { wake_prop_serial(cursor.as_ptr(), r.prop_offset) };
                     }
                 }
                 let _ = cursor.flush();
+            }
+
+            if bump {
+                let _ = bump_and_wake_global_serial(appcompat);
             }
         }
     } else {
@@ -522,6 +545,10 @@ pub fn delete(key: &str) -> SysPropResult<bool> {
     let cursor = area.into_inner();
     cursor.flush()?;
 
+    if deleted {
+        let _ = bump_and_wake_global_serial(ctx);
+    }
+
     // Dual-delete from appcompat_override area (Android 14+).
     if let Some(appcompat) = appcompat_ctx() {
         let ctx_name = appcompat.get_context_for_name(key);
@@ -530,6 +557,10 @@ pub fn delete(key: &str) -> SysPropResult<bool> {
             let _ = area.delete_property(key);
             let cursor = area.into_inner();
             let _ = cursor.flush();
+        }
+
+        if deleted {
+            let _ = bump_and_wake_global_serial(appcompat);
         }
     }
 

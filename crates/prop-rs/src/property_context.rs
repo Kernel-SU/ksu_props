@@ -680,6 +680,18 @@ impl PropertyContext {
         }
     }
 
+    /// Return the path to the global `properties_serial` prop-area file.
+    ///
+    /// In **Serialized** and **Split** modes this is `props_dir/properties_serial`.
+    /// In **PreSplit** mode the single prop-area file doubles as the serial area,
+    /// mirroring bionic's `ContextsPreSplit::GetSerialPropArea`.
+    pub fn serial_prop_area_path(&self) -> PathBuf {
+        match &self.storage {
+            ContextStorage::PreSplit => self.props_dir.clone(),
+            _ => self.props_dir.join("properties_serial"),
+        }
+    }
+
     /// Enumerate prop-area files under `props_dir` as `(context_name, path)`.
     ///
     /// - **PreSplit**: single entry `(PRE_SPLIT_CONTEXT, props_dir)`.
