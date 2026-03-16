@@ -246,8 +246,27 @@ pub fn check_proto(dir: &Path) -> bool {
     dir.join("persistent_properties").exists()
 }
 
+/// Validate that `key` is safe to use as a filename inside a directory.
+///
+/// Rejects empty keys, keys containing path separators (`/`, `\`), and keys
+/// that are or contain `..` path components.
+fn validate_legacy_key(key: &str) -> PersistentResult<()> {
+    if key.is_empty()
+        || key.contains('/')
+        || key.contains('\\')
+        || key == ".."
+        || key.starts_with("../")
+        || key.ends_with("/..")
+        || key.contains("/../")
+    {
+        return Err(PersistentPropError::InvalidPath(PathBuf::from(key)));
+    }
+    Ok(())
+}
+
 /// Read a single property from the legacy per-file storage.
 pub fn legacy_get_prop(dir: &Path, key: &str) -> PersistentResult<Option<String>> {
+    validate_legacy_key(key)?;
     let path = dir.join(key);
     match fs::read_to_string(&path) {
         Ok(val) => Ok(Some(val)),
@@ -258,12 +277,14 @@ pub fn legacy_get_prop(dir: &Path, key: &str) -> PersistentResult<Option<String>
 
 /// Write a single property to the legacy per-file storage using atomic write.
 pub fn legacy_set_prop(dir: &Path, key: &str, value: &str) -> PersistentResult<()> {
+    validate_legacy_key(key)?;
     let path = dir.join(key);
     write_bytes_atomically(&path, value.as_bytes())
 }
 
 /// Delete a single property from the legacy per-file storage.
 pub fn legacy_delete_prop(dir: &Path, key: &str) -> PersistentResult<bool> {
+    validate_legacy_key(key)?;
     let path = dir.join(key);
     match fs::remove_file(&path) {
         Ok(()) => Ok(true),
