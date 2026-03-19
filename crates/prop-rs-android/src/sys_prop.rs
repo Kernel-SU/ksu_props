@@ -16,6 +16,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write as IoWrite};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -333,20 +334,60 @@ unsafe fn wake_prop_serial(base: *const u8, prop_offset: u32) {
     futex_wake(prop_serial_ptr);
 }
 
+// ── Atomic helpers for mmap'd shared memory ─────────────────────────────────
+//
+// `PropArea<M>` writes serial fields through its generic `Write` impl, which
+// uses plain `copy_from_slice` — fine for regular files but **not** for
+// `MAP_SHARED` memory accessed concurrently by bionic readers in other
+// processes.  These helpers re-write serial values atomically with the correct
+// memory ordering, matching bionic's C++ `atomic_store_explicit` /
+// `atomic_load_explicit` usage.
+//
+// Safety invariant: all offsets passed to these functions must be 4-byte
+// aligned and within the mmap region.  This is guaranteed by the prop_area
+// layout (`repr(C)` structs with `u32` fields at natural alignment).
+
+/// Atomically store a `u32` at `base + offset` with `Release` ordering.
+///
+/// # Safety
+///
+/// `base + offset` must point to a valid, 4-byte-aligned `u32` within a
+/// `MAP_SHARED` mmap region.
+unsafe fn atomic_store_u32_release(base: *const u8, offset: usize, value: u32) {
+    let ptr = base.add(offset) as *const AtomicU32;
+    (*ptr).store(value, Ordering::Release);
+}
+
+/// Atomically load a `u32` from `base + offset` with `Relaxed` ordering.
+///
+/// # Safety
+///
+/// `base + offset` must point to a valid, 4-byte-aligned `u32` within a
+/// `MAP_SHARED` mmap region.
+unsafe fn atomic_load_u32_relaxed(base: *const u8, offset: usize) -> u32 {
+    let ptr = base.add(offset) as *const AtomicU32;
+    (*ptr).load(Ordering::Relaxed)
+}
+
 /// Bump the global `properties_serial` area serial and issue a futex wake.
 ///
 /// In bionic, this is the serial returned by `__system_property_area_serial()`
 /// and waited on by `__system_property_wait(NULL, ...)`.  It lives in a
 /// **separate** prop-area file (`properties_serial`), not in the prop-area
 /// that contains the property being modified.
+///
+/// The bump uses the same pattern as bionic (`system_properties.cpp`):
+///   `atomic_store_explicit(serial, atomic_load_explicit(serial, relaxed) + 1, release)`
+/// This is safe because there is only a single mutator (property_service / resetprop).
 fn bump_and_wake_global_serial(ctx: &PropertyContext) -> SysPropResult<()> {
     let serial_path = ctx.serial_prop_area_path();
-    let mut serial_area = open_area_rw(&serial_path)?;
-    serial_area.bump_area_serial()?;
+    let serial_area = open_area_rw(&serial_path)?;
     let cursor = serial_area.into_inner();
+    let serial_offset = AREA_SERIAL_OFFSET as usize;
     unsafe {
-        let serial_ptr = cursor.as_ptr().add(AREA_SERIAL_OFFSET as usize) as *const u32;
-        futex_wake(serial_ptr);
+        let old = atomic_load_u32_relaxed(cursor.as_ptr(), serial_offset);
+        atomic_store_u32_release(cursor.as_ptr(), serial_offset, old.wrapping_add(1));
+        futex_wake(cursor.as_ptr().add(serial_offset) as *const u32);
     }
     cursor.flush()?;
     Ok(())
@@ -528,6 +569,21 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
         let mut area = open_area_rw(&area_path)?;
         let result = area.set_property_with_serial(key, value, bump)?;
         let cursor = area.into_inner();
+
+        // PropArea wrote the serial via plain copy_from_slice (the generic
+        // Write impl).  Re-write it atomically with Release ordering so that
+        // all preceding value bytes are visible to bionic readers before they
+        // observe the new serial.  This matches bionic's protocol:
+        //   atomic_thread_fence(memory_order_release);
+        //   atomic_store_explicit(&pi->serial, new_serial, memory_order_relaxed);
+        // We combine both into a single store(Release).
+        let prop_serial_offset = PROP_AREA_HEADER_SIZE as usize
+            + result.prop_offset as usize
+            + PROP_INFO_SERIAL_OFFSET as usize;
+        unsafe {
+            atomic_store_u32_release(cursor.as_ptr(), prop_serial_offset, result.serial);
+        }
+
         if bump {
             unsafe { wake_prop_serial(cursor.as_ptr(), result.prop_offset) };
         }
@@ -548,8 +604,15 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
             if let Ok(mut area) = open_area_rw(&path) {
                 let result = area.set_property_with_serial(override_key, value, bump);
                 let cursor = area.into_inner();
-                if bump {
-                    if let Ok(r) = &result {
+                if let Ok(r) = &result {
+                    // Atomic re-write of the appcompat prop serial.
+                    let offset = PROP_AREA_HEADER_SIZE as usize
+                        + r.prop_offset as usize
+                        + PROP_INFO_SERIAL_OFFSET as usize;
+                    unsafe {
+                        atomic_store_u32_release(cursor.as_ptr(), offset, r.serial);
+                    }
+                    if bump {
                         unsafe { wake_prop_serial(cursor.as_ptr(), r.prop_offset) };
                     }
                 }
