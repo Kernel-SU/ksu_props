@@ -185,14 +185,6 @@ impl MmapCursor {
         Self { map, pos: 0 }
     }
 
-    fn flush(&self) -> io::Result<()> {
-        self
-            .map
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "mmap lock poisoned"))?
-            .flush()
-    }
-
     /// Return a raw pointer to the start of the mapped region.
     fn as_ptr(&self) -> *const u8 {
         self.map
@@ -275,11 +267,7 @@ impl IoWrite for MmapCursor {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self
-            .map
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "mmap lock poisoned"))?
-            .flush()
+        Ok(())
     }
 }
 
@@ -513,7 +501,6 @@ fn bump_and_wake_global_serial(ctx: &CachedPropertyContext) -> SysPropResult<()>
         atomic_store_u32_release(cursor.as_ptr(), serial_offset, old.wrapping_add(1));
         futex_wake(cursor.as_ptr().add(serial_offset) as *const u32);
     }
-    cursor.flush()?;
     Ok(())
 }
 
@@ -707,7 +694,6 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
         if bump {
             unsafe { wake_prop_serial(cursor.as_ptr(), result.prop_offset) };
         }
-        cursor.flush()?;
 
         if bump {
             bump_and_wake_global_serial(ctx)?;
@@ -756,7 +742,6 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
                         unsafe { wake_prop_serial(cursor.as_ptr(), r.prop_offset) };
                     }
                 }
-                let _ = cursor.flush();
 
                 if bump {
                     let _ = bump_and_wake_global_serial(appcompat);
@@ -801,8 +786,6 @@ pub fn delete(key: &str) -> SysPropResult<bool> {
     let context = ctx.get_context_for_name(key);
     let mut area = ctx.open_area_rw(context)?;
     let deleted = area.delete_property(key)?;
-    let cursor = area.into_inner();
-    cursor.flush()?;
 
     if deleted {
         let _ = bump_and_wake_global_serial(ctx);
@@ -814,8 +797,6 @@ pub fn delete(key: &str) -> SysPropResult<bool> {
         let ctx_name = appcompat.get_context_for_name(override_key);
         if let Ok(mut area) = appcompat.open_area_rw(ctx_name) {
             let _ = area.delete_property(override_key);
-            let cursor = area.into_inner();
-            let _ = cursor.flush();
         }
 
         if deleted {
@@ -858,7 +839,6 @@ fn compact_areas(ctx: &CachedPropertyContext, filter: Option<&str>) -> SysPropRe
                 if !matches!(result, prop_rs::CompactResult::NoHoles) {
                     any_compacted = true;
                 }
-                area.into_inner().flush()?;
             }
             Err(_) => {}
         }
@@ -874,7 +854,6 @@ fn compact_areas(ctx: &CachedPropertyContext, filter: Option<&str>) -> SysPropRe
                     if !matches!(result, prop_rs::CompactResult::NoHoles) {
                         any_compacted = true;
                     }
-                    area.into_inner().flush()?;
                 }
                 Err(_) => continue,
             }
