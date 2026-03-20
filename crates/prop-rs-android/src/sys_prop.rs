@@ -591,6 +591,27 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
 
         if bump {
             bump_and_wake_global_serial(ctx)?;
+
+            // Phase 3: restore the serial to its original counter value to
+            // hide the modification, matching bionic's Update():
+            //   atomic_thread_fence(memory_order_release);
+            //   new_serial = (len << 24) | ((serial & ~1) & 0xffffff);
+            //   atomic_store_explicit(&pi->serial, new_serial, relaxed);
+            // The bumped serial already woke futex waiters above; now we
+            // put the counter back so detection tools don't see a change.
+            //
+            // compose_serial(bump=true) produces:
+            //   bumped = (len << 24) | flags | (((old_counter | 1) + 1) & 0xffffff)
+            // bionic restores with:
+            //   restored = (len << 24) | flags | ((old_counter & ~1) & 0xffffff)
+            // Since (old|1)+1 = old+2 when bit0=0, or old+1 when bit0=1,
+            // and (old & ~1) = (old|1) - 1, we have:
+            //   restored_counter = bumped_counter - 2   (mod 2^24)
+            let restored_serial = (result.serial & 0xff00_0000)
+                | (result.serial.wrapping_sub(2) & 0x00ff_ffff);
+            unsafe {
+                atomic_store_u32_release(cursor.as_ptr(), prop_serial_offset, restored_serial);
+            }
         }
 
         // Dual-write to appcompat_override area (Android 14+).
@@ -606,20 +627,34 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
                 let cursor = area.into_inner();
                 if let Ok(r) = &result {
                     // Atomic re-write of the appcompat prop serial.
-                    let offset = PROP_AREA_HEADER_SIZE as usize
+                    let ac_serial_offset = PROP_AREA_HEADER_SIZE as usize
                         + r.prop_offset as usize
                         + PROP_INFO_SERIAL_OFFSET as usize;
                     unsafe {
-                        atomic_store_u32_release(cursor.as_ptr(), offset, r.serial);
+                        atomic_store_u32_release(cursor.as_ptr(), ac_serial_offset, r.serial);
                     }
                     if bump {
                         unsafe { wake_prop_serial(cursor.as_ptr(), r.prop_offset) };
                     }
                 }
                 let _ = cursor.flush();
-            }
 
-            if bump {
+                if bump {
+                    let _ = bump_and_wake_global_serial(appcompat);
+
+                    // Phase 3: restore appcompat prop serial (same as main area).
+                    if let Ok(r) = &result {
+                        let ac_serial_offset = PROP_AREA_HEADER_SIZE as usize
+                            + r.prop_offset as usize
+                            + PROP_INFO_SERIAL_OFFSET as usize;
+                        let restored = (r.serial & 0xff00_0000)
+                            | (r.serial.wrapping_sub(2) & 0x00ff_ffff);
+                        unsafe {
+                            atomic_store_u32_release(cursor.as_ptr(), ac_serial_offset, restored);
+                        }
+                    }
+                }
+            } else if bump {
                 let _ = bump_and_wake_global_serial(appcompat);
             }
         }
