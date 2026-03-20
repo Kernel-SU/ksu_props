@@ -17,7 +17,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write as IoWrite};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use memmap2::{MmapMut, MmapOptions};
@@ -175,28 +176,39 @@ fn api() -> &'static BionicApi {
 /// This is the same pattern used by `tools/sysprop/src/main.rs` to bridge
 /// `memmap2::MmapMut` into `prop_rs::PropArea`.
 struct MmapCursor {
-    map: MmapMut,
+    map: Arc<Mutex<MmapMut>>,
     pos: usize,
 }
 
 impl MmapCursor {
-    fn new(map: MmapMut) -> Self {
+    fn new(map: Arc<Mutex<MmapMut>>) -> Self {
         Self { map, pos: 0 }
     }
 
     fn flush(&self) -> io::Result<()> {
-        self.map.flush()
+        self
+            .map
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "mmap lock poisoned"))?
+            .flush()
     }
 
     /// Return a raw pointer to the start of the mapped region.
     fn as_ptr(&self) -> *const u8 {
-        self.map.as_ptr()
+        self.map
+            .lock()
+            .expect("mmap lock poisoned")
+            .as_ptr()
     }
 }
 
 impl Read for MmapCursor {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let data = self.map.as_ref();
+        let map = self
+            .map
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "mmap lock poisoned"))?;
+        let data = map.as_ref();
         if self.pos >= data.len() {
             return Ok(0);
         }
@@ -209,7 +221,11 @@ impl Read for MmapCursor {
 
 impl Seek for MmapCursor {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let len = self.map.as_ref().len() as i64;
+        let len = self
+            .map
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "mmap lock poisoned"))?
+            .len() as i64;
         let current = self.pos as i64;
         let next = match pos {
             SeekFrom::Start(offset) => i64::try_from(offset)
@@ -235,7 +251,11 @@ impl Seek for MmapCursor {
 
 impl IoWrite for MmapCursor {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let data = &mut self.map[..];
+        let mut map = self
+            .map
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "mmap lock poisoned"))?;
+        let data = &mut map[..];
         if self.pos > data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -255,17 +275,136 @@ impl IoWrite for MmapCursor {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.map.flush()
+        self
+            .map
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "mmap lock poisoned"))?
+            .flush()
     }
 }
 
 // ── PropertyContext singletons ───────────────────────────────────────────────
 
-static PROP_CTX: OnceLock<PropertyContext> = OnceLock::new();
+static PROP_CTX: OnceLock<CachedPropertyContext> = OnceLock::new();
 
 /// Appcompat override context for Android 14+ dual-write support.
 /// `None` when the appcompat_override directory does not exist.
-static APPCOMPAT_CTX: OnceLock<Option<PropertyContext>> = OnceLock::new();
+static APPCOMPAT_CTX: OnceLock<Option<CachedPropertyContext>> = OnceLock::new();
+
+struct CachedArea {
+    path: PathBuf,
+    map: Arc<Mutex<MmapMut>>,
+}
+
+/// Per-PropertyContext cache wrapper.
+///
+/// Each wrapper owns:
+/// - an area cache map keyed by context name
+/// - a dedicated cached serial area mmap
+///
+/// This keeps main props and appcompat props fully isolated even when context
+/// names overlap.
+struct CachedPropertyContext {
+    ctx: PropertyContext,
+    area_cache: Mutex<HashMap<String, CachedArea>>,
+    serial_area: Mutex<Option<CachedArea>>,
+}
+
+impl CachedPropertyContext {
+    fn new(ctx: PropertyContext) -> Self {
+        Self {
+            ctx,
+            area_cache: Mutex::new(HashMap::new()),
+            serial_area: Mutex::new(None),
+        }
+    }
+
+    fn get_context_for_name(&self, name: &str) -> &str {
+        self.ctx.get_context_for_name(name)
+    }
+
+    fn prop_area_files(&self) -> io::Result<Vec<(String, PathBuf)>> {
+        self.ctx.prop_area_files()
+    }
+
+    fn open_area_rw(&self, context: &str) -> SysPropResult<PropArea<MmapCursor>> {
+        let path = self.ctx.context_file_path(context);
+        let shared = {
+            let mut cache = self
+                .area_cache
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "area cache lock poisoned"))?;
+
+            if let Some(entry) = cache.get(context) {
+                if entry.path == path {
+                    Arc::clone(&entry.map)
+                } else {
+                    let f = OpenOptions::new().read(true).write(true).open(&path)?;
+                    let map = unsafe { MmapOptions::new().map_mut(&f) }?;
+                    let shared = Arc::new(Mutex::new(map));
+                    cache.insert(
+                        context.to_owned(),
+                        CachedArea {
+                            path: path.to_path_buf(),
+                            map: Arc::clone(&shared),
+                        },
+                    );
+                    shared
+                }
+            } else {
+                let f = OpenOptions::new().read(true).write(true).open(&path)?;
+                let map = unsafe { MmapOptions::new().map_mut(&f) }?;
+                let shared = Arc::new(Mutex::new(map));
+                cache.insert(
+                    context.to_owned(),
+                    CachedArea {
+                        path: path.to_path_buf(),
+                        map: Arc::clone(&shared),
+                    },
+                );
+                shared
+            }
+        };
+
+        Ok(PropArea::new(MmapCursor::new(shared))?)
+    }
+
+    fn open_serial_area_rw(&self) -> SysPropResult<PropArea<MmapCursor>> {
+        let path = self.ctx.serial_prop_area_path();
+        let shared = {
+            let mut cached = self
+                .serial_area
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "serial area cache lock poisoned"))?;
+
+            if let Some(entry) = cached.as_ref() {
+                if entry.path == path {
+                    Arc::clone(&entry.map)
+                } else {
+                    let f = OpenOptions::new().read(true).write(true).open(&path)?;
+                    let map = unsafe { MmapOptions::new().map_mut(&f) }?;
+                    let shared = Arc::new(Mutex::new(map));
+                    *cached = Some(CachedArea {
+                        path: path.clone(),
+                        map: Arc::clone(&shared),
+                    });
+                    shared
+                }
+            } else {
+                let f = OpenOptions::new().read(true).write(true).open(&path)?;
+                let map = unsafe { MmapOptions::new().map_mut(&f) }?;
+                let shared = Arc::new(Mutex::new(map));
+                *cached = Some(CachedArea {
+                    path: path.clone(),
+                    map: Arc::clone(&shared),
+                });
+                shared
+            }
+        };
+
+        Ok(PropArea::new(MmapCursor::new(shared))?)
+    }
+}
 
 const APPCOMPAT_DIR: &str = "/dev/__properties__/appcompat_override";
 const APPCOMPAT_PREFIX: &str = "ro.appcompat_override.";
@@ -276,7 +415,7 @@ fn strip_appcompat_prefix(key: &str) -> &str {
     key.strip_prefix(APPCOMPAT_PREFIX).unwrap_or(key)
 }
 
-fn prop_ctx() -> SysPropResult<&'static PropertyContext> {
+fn prop_ctx() -> SysPropResult<&'static CachedPropertyContext> {
     PROP_CTX
         .get()
         .ok_or_else(|| SysPropError::Io(io::Error::new(
@@ -285,15 +424,8 @@ fn prop_ctx() -> SysPropResult<&'static PropertyContext> {
         )))
 }
 
-fn appcompat_ctx() -> Option<&'static PropertyContext> {
+fn appcompat_ctx() -> Option<&'static CachedPropertyContext> {
     APPCOMPAT_CTX.get().and_then(|opt| opt.as_ref())
-}
-
-/// Open a prop area file read-write via shared mmap.
-fn open_area_rw(path: &Path) -> SysPropResult<PropArea<MmapCursor>> {
-    let f = OpenOptions::new().read(true).write(true).open(path)?;
-    let map = unsafe { MmapOptions::new().map_mut(&f) }?;
-    Ok(PropArea::new(MmapCursor::new(map))?)
 }
 
 // ── Futex helper ────────────────────────────────────────────────────────────
@@ -372,9 +504,8 @@ unsafe fn atomic_load_u32_relaxed(base: *const u8, offset: usize) -> u32 {
 /// The bump uses the same pattern as bionic (`system_properties.cpp`):
 ///   `atomic_store_explicit(serial, atomic_load_explicit(serial, relaxed) + 1, release)`
 /// This is safe because there is only a single mutator (property_service / resetprop).
-fn bump_and_wake_global_serial(ctx: &PropertyContext) -> SysPropResult<()> {
-    let serial_path = ctx.serial_prop_area_path();
-    let serial_area = open_area_rw(&serial_path)?;
+fn bump_and_wake_global_serial(ctx: &CachedPropertyContext) -> SysPropResult<()> {
+    let serial_area = ctx.open_serial_area_rw()?;
     let cursor = serial_area.into_inner();
     let serial_offset = AREA_SERIAL_OFFSET as usize;
     unsafe {
@@ -419,11 +550,11 @@ pub fn init() -> SysPropResult<()> {
 
     // Initialize PropertyContext for prop-rs mmap operations.
     let _ = PROP_CTX.get_or_init(|| {
-        PropertyContext::new(
+        CachedPropertyContext::new(PropertyContext::new(
             Path::new("/dev/__properties__"),
             Some(Path::new("/")),
         )
-        .expect("failed to load PropertyContext from /dev/__properties__")
+        .expect("failed to load PropertyContext from /dev/__properties__"))
     });
 
     // Initialize appcompat_override context (Android 14+).
@@ -433,7 +564,9 @@ pub fn init() -> SysPropResult<()> {
         if !dir.is_dir() {
             return None;
         }
-        PropertyContext::new(&dir, Some(Path::new("/"))).ok()
+        PropertyContext::new(&dir, Some(Path::new("/")))
+            .ok()
+            .map(CachedPropertyContext::new)
     });
 
     Ok(())
@@ -553,8 +686,7 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
 
         let ctx = prop_ctx()?;
         let context = ctx.get_context_for_name(key);
-        let area_path = ctx.context_file_path(context);
-        let mut area = open_area_rw(&area_path)?;
+        let mut area = ctx.open_area_rw(context)?;
         let result = area.set_property_with_serial(key, value, bump)?;
         let cursor = area.into_inner();
 
@@ -609,8 +741,7 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
         if let Some(appcompat) = appcompat_ctx() {
             let override_key = strip_appcompat_prefix(key);
             let ctx_name = appcompat.get_context_for_name(override_key);
-            let path = appcompat.context_file_path(ctx_name);
-            if let Ok(mut area) = open_area_rw(&path) {
+            if let Ok(mut area) = appcompat.open_area_rw(ctx_name) {
                 let result = area.set_property_with_serial(override_key, value, bump);
                 let cursor = area.into_inner();
                 if let Ok(r) = &result {
@@ -668,8 +799,7 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
 pub fn delete(key: &str) -> SysPropResult<bool> {
     let ctx = prop_ctx()?;
     let context = ctx.get_context_for_name(key);
-    let area_path = ctx.context_file_path(context);
-    let mut area = open_area_rw(&area_path)?;
+    let mut area = ctx.open_area_rw(context)?;
     let deleted = area.delete_property(key)?;
     let cursor = area.into_inner();
     cursor.flush()?;
@@ -682,8 +812,7 @@ pub fn delete(key: &str) -> SysPropResult<bool> {
     if let Some(appcompat) = appcompat_ctx() {
         let override_key = strip_appcompat_prefix(key);
         let ctx_name = appcompat.get_context_for_name(override_key);
-        let path = appcompat.context_file_path(ctx_name);
-        if let Ok(mut area) = open_area_rw(&path) {
+        if let Ok(mut area) = appcompat.open_area_rw(ctx_name) {
             let _ = area.delete_property(override_key);
             let cursor = area.into_inner();
             let _ = cursor.flush();
@@ -719,12 +848,11 @@ pub fn compact(context: Option<&str>) -> SysPropResult<bool> {
     Ok(any_compacted)
 }
 
-fn compact_areas(ctx: &PropertyContext, filter: Option<&str>) -> SysPropResult<bool> {
+fn compact_areas(ctx: &CachedPropertyContext, filter: Option<&str>) -> SysPropResult<bool> {
     let mut any_compacted = false;
 
     if let Some(context) = filter {
-        let path = ctx.context_file_path(context);
-        let mut area = open_area_rw(&path)?;
+        let mut area = ctx.open_area_rw(context)?;
         match area.compact_allocations() {
             Ok(result) => {
                 if !matches!(result, prop_rs::CompactResult::NoHoles) {
@@ -736,8 +864,8 @@ fn compact_areas(ctx: &PropertyContext, filter: Option<&str>) -> SysPropResult<b
         }
     } else {
         let targets = ctx.prop_area_files().map_err(SysPropError::Io)?;
-        for (_context, path) in &targets {
-            let mut area = match open_area_rw(path) {
+        for (context, _path) in &targets {
+            let mut area = match ctx.open_area_rw(context) {
                 Ok(area) => area,
                 Err(_) => continue,
             };
