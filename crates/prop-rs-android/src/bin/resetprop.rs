@@ -1,12 +1,27 @@
 use anyhow::{bail, Context, Result};
+use clap::error::ErrorKind;
 use clap::Parser;
 use log::info;
 use prop_rs_android::resetprop::ResetProp;
 use prop_rs_android::sys_prop;
+use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::Duration;
+
+#[derive(Debug)]
+struct WaitTimeoutError {
+    name: String,
+}
+
+impl fmt::Display for WaitTimeoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "timeout waiting for {}", self.name)
+    }
+}
+
+impl std::error::Error for WaitTimeoutError {}
 
 /// Magisk-compatible Android system property tool.
 #[derive(Parser)]
@@ -68,8 +83,13 @@ struct Args {
 
 fn main() {
     if let Err(err) = run_from_args(&std::env::args().collect::<Vec<_>>()) {
+        let code = if err.downcast_ref::<WaitTimeoutError>().is_some() {
+            2
+        } else {
+            1
+        };
         eprintln!("resetprop: {err:#}");
-        std::process::exit(1);
+        std::process::exit(code);
     }
 }
 
@@ -77,7 +97,16 @@ fn main() {
 ///
 /// `args` should include argv[0] (the program name).
 pub fn run_from_args(args: &[String]) -> Result<()> {
-    let cli = Args::try_parse_from(args).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let cli = match Args::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(err) => {
+            if matches!(err.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                err.print()?;
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!("{err}"));
+        }
+    };
 
     sys_prop::init().context("Failed to initialize system property API")?;
 
@@ -109,7 +138,10 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
             .wait(name, cli.value.as_deref(), timeout)
             .context("wait failed")?;
         if !ok {
-            bail!("timeout waiting for {name}");
+            return Err(WaitTimeoutError {
+                name: name.to_owned(),
+            }
+            .into());
         }
         return Ok(());
     }

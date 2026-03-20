@@ -900,8 +900,9 @@ pub fn wait(
         let old = area_serial().unwrap_or(0);
         let mut new_serial = 0u32;
         let ts = remaining_timespec(deadline);
-        unsafe {
-            wait_fn(std::ptr::null(), old, &mut new_serial, ts_ptr(&ts));
+        let changed = unsafe { wait_fn(std::ptr::null(), old, &mut new_serial, ts_ptr(&ts)) };
+        if !changed && deadline.is_some() {
+            return Ok(false);
         }
     };
 
@@ -912,6 +913,10 @@ pub fn wait(
     };
 
     // Phase 2: wait for value != old_value.
+    // Prefer waiting on global serial when available. For direct mmap writes,
+    // prop serial may be restored to hide modifications, but global serial is
+    // still bumped and reliably signals that some property changed.
+    let use_global_wait = api().area_serial.is_some();
     loop {
         if let Some(dl) = deadline {
             if std::time::Instant::now() >= dl {
@@ -929,8 +934,14 @@ pub fn wait(
         // Current value still equals old_value — wait for serial change.
         let mut new_serial = 0u32;
         let ts = remaining_timespec(deadline);
-        unsafe {
-            wait_fn(info.as_ptr(), curr_serial, &mut new_serial, ts_ptr(&ts));
+        let changed = if use_global_wait {
+            let old_global = area_serial().unwrap_or(0);
+            unsafe { wait_fn(std::ptr::null(), old_global, &mut new_serial, ts_ptr(&ts)) }
+        } else {
+            unsafe { wait_fn(info.as_ptr(), curr_serial, &mut new_serial, ts_ptr(&ts)) }
+        };
+        if !changed && deadline.is_some() {
+            return Ok(false);
         }
     }
 }
