@@ -1,2 +1,4 @@
 [alias]
 android-sysprop = "run --bin cargo_android_sysprop --"
+push-resetprop = "run -p cargo-android-sysprop --bin cargo-android-resetprop -- --target aarch64-linux-android"
+test-resetprop = "run -p cargo-android-sysprop --bin cargo-android-resetprop -- --target aarch64-linux-android --run-test"

@@ -7,5 +7,9 @@ edition = "2021"
 name = "cargo-android-sysprop"
 path = "src/main.rs"
 
+[[bin]]
+name = "cargo-android-resetprop"
+path = "src/resetprop.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
