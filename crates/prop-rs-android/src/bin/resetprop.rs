@@ -70,6 +70,11 @@ struct Args {
     #[arg(short = 'c', long = "compact")]
     compact: bool,
 
+    /// Print prop serial parts: "<counter> <len>" where
+    /// counter = serial & 0x00ff_ffff, len = serial >> 24.
+    #[arg(long = "serial")]
+    serial_parts: bool,
+
     /// Show SELinux context when listing properties.
     #[arg(short = 'Z')]
     show_context: bool,
@@ -122,9 +127,28 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
     let special_modes = u8::from(cli.wait)
         + u8::from(cli.delete)
         + u8::from(cli.compact)
+        + u8::from(cli.serial_parts)
         + u8::from(cli.file.is_some());
     if special_modes > 1 {
         bail!("multiple operation modes detected");
+    }
+
+    // --serial: print serial counter and len parts
+    if cli.serial_parts {
+        let name = cli
+            .name
+            .as_deref()
+            .context("--serial requires a property name")?;
+        if cli.value.is_some() {
+            bail!("--serial does not accept a property value");
+        }
+
+        let pi = sys_prop::find(name).with_context(|| format!("{name} not found"))?;
+        let serial = sys_prop::serial(pi);
+        let counter = serial & 0x00ff_ffff;
+        let len = serial >> 24;
+        println!("{counter} {len}");
+        return Ok(());
     }
 
     // -w: wait mode

@@ -89,6 +89,15 @@ rp_get() {
     return $rc
 }
 
+# serial 查询：输出 "<counter> <len>"
+_rp_serial_tmp="${TMP}/_rp_serial_$$"
+rp_serial() {
+    "$RESETPROP" --serial "$1" >"$_rp_serial_tmp" 2>/dev/null
+    local rc=$?
+    cat "$_rp_serial_tmp"
+    return $rc
+}
+
 # 列表操作：输出到临时文件，避免变量过大导致 "Argument list too long"
 _rp_list_tmp="${TMP}/_rp_list_$$"
 rp_list() {
@@ -216,7 +225,8 @@ trap cleanup EXIT
 # 预注册测试属性
 for name in basic overwrite empty special maxlen long \
             file1 file2 file3 wait wait_change \
-            compact1 compact2 compact3; do
+            compact1 compact2 compact3 \
+            serial_add serial_len; do
     register_cleanup "${TEST_PREFIX}.${name}"
 done
 for i in 1 2 3 4 5; do
@@ -863,6 +873,50 @@ assert_eq "15.2c 长值写入失败后保留原短值" "short" "$val"
 rp_set -n "${TEST_PREFIX}.basic" "back_to_short"
 val=$(rp_get "${TEST_PREFIX}.basic")
 assert_eq "15.2d 切换回短值" "back_to_short" "$val"
+
+# ============================================================================
+# 测试组 16: serial 计数器和长度
+# ============================================================================
+
+section "16. serial 计数器和长度"
+
+# 16.1 首次 -n 添加属性后，serial 计数器应为 0
+$RESETPROP -d "${TEST_PREFIX}.serial_add" >/dev/null 2>&1
+rp_set -n "${TEST_PREFIX}.serial_add" "first"
+parts=$(rp_serial "${TEST_PREFIX}.serial_add")
+if [ $? -ne 0 ]; then
+    log_fail "16.1 读取 serial 失败" "exit=0" "exit!=0"
+else
+    set -- $parts
+    counter="${1:-}"
+    len_part="${2:-}"
+    assert_eq "16.1a 首次添加计数器为 0" "0" "$counter"
+    assert_eq "16.1b 首次添加 len 匹配" "5" "$len_part"
+fi
+
+# 16.2 -n 更新属性（长度变化）前后，serial 计数器应不变
+rp_set -n "${TEST_PREFIX}.serial_len" "abcd"
+parts=$(rp_serial "${TEST_PREFIX}.serial_len")
+if [ $? -ne 0 ]; then
+    log_fail "16.2 读取更新前 serial 失败" "exit=0" "exit!=0"
+else
+    set -- $parts
+    counter_before="${1:-}"
+    len_before="${2:-}"
+    assert_eq "16.2a 更新前 len 匹配" "4" "$len_before"
+
+    rp_set -n "${TEST_PREFIX}.serial_len" "abcdefghij"
+    parts_after=$(rp_serial "${TEST_PREFIX}.serial_len")
+    if [ $? -ne 0 ]; then
+        log_fail "16.2 读取更新后 serial 失败" "exit=0" "exit!=0"
+    else
+        set -- $parts_after
+        counter_after="${1:-}"
+        len_after="${2:-}"
+        assert_eq "16.2b 长度变化后计数器不变" "$counter_before" "$counter_after"
+        assert_eq "16.2c 长度变化后 len 匹配" "10" "$len_after"
+    fi
+fi
 
 # ============================================================================
 # 测试结果汇总
