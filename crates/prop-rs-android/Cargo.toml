@@ -7,6 +7,4 @@ edition = "2021"
 prop-rs = { path = "../prop-rs" }
 libc = "0.2"
 memmap2 = "0.9"
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
 log = "0.4"

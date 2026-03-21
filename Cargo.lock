@@ -198,8 +198,6 @@ dependencies = [
 name = "prop-rs-android"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "clap",
  "libc",
  "log",
  "memmap2",
