@@ -1,10 +1,11 @@
-//! Bionic `__system_property_*` API wrapper via `dlsym` + `prop-rs` mmap.
+//! Bionic `__system_property_*` API wrapper via `dlsym` + mmap.
 //!
 //! This module dynamically loads Android bionic's **standard** system property
 //! functions at runtime and exposes a safe Rust API.  For operations that
 //! stock bionic does not support (add, update, delete, get_context), we use
-//! `prop-rs`'s pure-Rust `PropArea` implementation operating directly on the
-//! mmap'd shared-memory files under `/dev/__properties__`.
+//! [`crate::mmap_prop_area::MmapPropArea`] which operates directly on the
+//! `MAP_SHARED` mmap files under `/dev/__properties__` with the exact atomic
+//! memory-ordering semantics required by bionic's concurrent readers.
 //!
 //! This replaces Magisk's approach of linking against a patched bionic with
 //! `__system_property_*2` symbols, making the code work on KernelSU without
@@ -13,18 +14,18 @@
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::{self, Read, Seek, SeekFrom, Write as IoWrite};
+use std::io;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use memmap2::{MmapMut, MmapOptions};
-use prop_rs::{
-    PropArea, PropAreaError, PropertyContext, AREA_SERIAL_OFFSET, PROP_AREA_HEADER_SIZE,
-    PROP_INFO_SERIAL_OFFSET, PROP_VALUE_MAX,
+use memmap2::MmapOptions;
+use prop_rs::{PropertyContext, PROP_VALUE_MAX};
+
+use crate::mmap_prop_area::{
+    MmapPropArea, MmapPropAreaError,
 };
 
 // ── Error type ──────────────────────────────────────────────────────────────
@@ -37,8 +38,8 @@ pub enum SysPropError {
     InitFailed(c_int),
     /// `__system_property_set` returned a non-zero error code.
     SetFailed(c_int),
-    /// A prop-area operation failed.
-    PropArea(PropAreaError),
+    /// A mmap prop-area operation failed.
+    MmapPropArea(MmapPropAreaError),
     /// An I/O error occurred during mmap operations.
     Io(io::Error),
     /// The property key or value contains an interior NUL byte.
@@ -59,7 +60,7 @@ impl fmt::Display for SysPropError {
             Self::SymbolNotFound(sym) => write!(f, "bionic symbol not found: {sym}"),
             Self::InitFailed(code) => write!(f, "__system_properties_init failed: {code}"),
             Self::SetFailed(code) => write!(f, "__system_property_set failed: {code}"),
-            Self::PropArea(e) => write!(f, "prop area error: {e}"),
+            Self::MmapPropArea(e) => write!(f, "mmap prop area error: {e}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::InvalidCString(s) => write!(f, "invalid C string: {s}"),
             Self::ValueTooLong { key, len, max_len } => {
@@ -81,9 +82,9 @@ impl From<prop_rs::PersistentPropError> for SysPropError {
     }
 }
 
-impl From<PropAreaError> for SysPropError {
-    fn from(e: PropAreaError) -> Self {
-        Self::PropArea(e)
+impl From<MmapPropAreaError> for SysPropError {
+    fn from(e: MmapPropAreaError) -> Self {
+        Self::MmapPropArea(e)
     }
 }
 
@@ -169,107 +170,7 @@ fn api() -> &'static BionicApi {
     API.get().expect("sys_prop::init() must be called first")
 }
 
-// ── MmapCursor ──────────────────────────────────────────────────────────────
-
-/// A `Read + Write + Seek` cursor over a memory-mapped region.
-///
-/// This is the same pattern used by `tools/sysprop/src/main.rs` to bridge
-/// `memmap2::MmapMut` into `prop_rs::PropArea`.
-struct MmapCursor {
-    map: Arc<Mutex<MmapMut>>,
-    pos: usize,
-}
-
-impl MmapCursor {
-    fn new(map: Arc<Mutex<MmapMut>>) -> Self {
-        Self { map, pos: 0 }
-    }
-
-    /// Return a raw pointer to the start of the mapped region.
-    fn as_ptr(&self) -> *const u8 {
-        self.map
-            .lock()
-            .expect("mmap lock poisoned")
-            .as_ptr()
-    }
-}
-
-impl Read for MmapCursor {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let map = self
-            .map
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "mmap lock poisoned"))?;
-        let data = map.as_ref();
-        if self.pos >= data.len() {
-            return Ok(0);
-        }
-        let count = (data.len() - self.pos).min(buf.len());
-        buf[..count].copy_from_slice(&data[self.pos..self.pos + count]);
-        self.pos += count;
-        Ok(count)
-    }
-}
-
-impl Seek for MmapCursor {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let len = self
-            .map
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "mmap lock poisoned"))?
-            .len() as i64;
-        let current = self.pos as i64;
-        let next = match pos {
-            SeekFrom::Start(offset) => i64::try_from(offset)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "seek overflow"))?,
-            SeekFrom::End(offset) => len
-                .checked_add(offset)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek overflow"))?,
-            SeekFrom::Current(offset) => current
-                .checked_add(offset)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek overflow"))?,
-        };
-        if next < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cannot seek before start of mmap",
-            ));
-        }
-        self.pos = usize::try_from(next)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "seek overflow"))?;
-        Ok(self.pos as u64)
-    }
-}
-
-impl IoWrite for MmapCursor {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "mmap lock poisoned"))?;
-        let data = &mut map[..];
-        if self.pos > data.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "write past end of mmap",
-            ));
-        }
-        let remaining = data.len() - self.pos;
-        if buf.len() > remaining {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "mmap write exceeds mapped region",
-            ));
-        }
-        data[self.pos..self.pos + buf.len()].copy_from_slice(buf);
-        self.pos += buf.len();
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
+// ── MmapPropArea cache ──────────────────────────────────────────────────────
 
 // ── PropertyContext singletons ───────────────────────────────────────────────
 
@@ -279,23 +180,15 @@ static PROP_CTX: OnceLock<CachedPropertyContext> = OnceLock::new();
 /// `None` when the appcompat_override directory does not exist.
 static APPCOMPAT_CTX: OnceLock<Option<CachedPropertyContext>> = OnceLock::new();
 
-struct CachedArea {
-    path: PathBuf,
-    map: Arc<Mutex<MmapMut>>,
-}
-
-/// Per-PropertyContext cache wrapper.
+/// Per-PropertyContext cache wrapper that opens prop area files as
+/// `MAP_SHARED` mmap regions and wraps them in `MmapPropArea`.
 ///
-/// Each wrapper owns:
-/// - an area cache map keyed by context name
-/// - a dedicated cached serial area mmap
-///
-/// This keeps main props and appcompat props fully isolated even when context
-/// names overlap.
+/// Areas are cached lazily: first access mmaps and stores; later accesses reuse
+/// the mapped region so writes do not remap every time.
 struct CachedPropertyContext {
     ctx: PropertyContext,
-    area_cache: Mutex<HashMap<String, CachedArea>>,
-    serial_area: Mutex<Option<CachedArea>>,
+    area_cache: Mutex<HashMap<String, MmapPropArea>>,
+    serial_area: Mutex<Option<MmapPropArea>>,
 }
 
 impl CachedPropertyContext {
@@ -315,82 +208,103 @@ impl CachedPropertyContext {
         self.ctx.prop_area_files()
     }
 
-    fn open_area_rw(&self, context: &str) -> SysPropResult<PropArea<MmapCursor>> {
+    fn map_context_area(&self, context: &str) -> SysPropResult<MmapPropArea> {
         let path = self.ctx.context_file_path(context);
-        let shared = {
-            let mut cache = self
-                .area_cache
-                .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "area cache lock poisoned"))?;
-
-            if let Some(entry) = cache.get(context) {
-                if entry.path == path {
-                    Arc::clone(&entry.map)
-                } else {
-                    let f = OpenOptions::new().read(true).write(true).open(&path)?;
-                    let map = unsafe { MmapOptions::new().map_mut(&f) }?;
-                    let shared = Arc::new(Mutex::new(map));
-                    cache.insert(
-                        context.to_owned(),
-                        CachedArea {
-                            path: path.to_path_buf(),
-                            map: Arc::clone(&shared),
-                        },
-                    );
-                    shared
-                }
-            } else {
-                let f = OpenOptions::new().read(true).write(true).open(&path)?;
-                let map = unsafe { MmapOptions::new().map_mut(&f) }?;
-                let shared = Arc::new(Mutex::new(map));
-                cache.insert(
-                    context.to_owned(),
-                    CachedArea {
-                        path: path.to_path_buf(),
-                        map: Arc::clone(&shared),
-                    },
-                );
-                shared
-            }
-        };
-
-        Ok(PropArea::new(MmapCursor::new(shared))?)
+        let f = OpenOptions::new().read(true).write(true).open(&path)?;
+        let map = unsafe { MmapOptions::new().map_mut(&f) }?;
+        Ok(MmapPropArea::new(map)?)
     }
 
-    fn open_serial_area_rw(&self) -> SysPropResult<PropArea<MmapCursor>> {
+    fn map_serial_area(&self) -> SysPropResult<MmapPropArea> {
         let path = self.ctx.serial_prop_area_path();
-        let shared = {
-            let mut cached = self
-                .serial_area
-                .lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "serial area cache lock poisoned"))?;
+        let f = OpenOptions::new().read(true).write(true).open(&path)?;
+        let map = unsafe { MmapOptions::new().map_mut(&f) }?;
+        Ok(MmapPropArea::new(map)?)
+    }
 
-            if let Some(entry) = cached.as_ref() {
-                if entry.path == path {
-                    Arc::clone(&entry.map)
-                } else {
-                    let f = OpenOptions::new().read(true).write(true).open(&path)?;
-                    let map = unsafe { MmapOptions::new().map_mut(&f) }?;
-                    let shared = Arc::new(Mutex::new(map));
-                    *cached = Some(CachedArea {
-                        path: path.clone(),
-                        map: Arc::clone(&shared),
-                    });
-                    shared
-                }
-            } else {
-                let f = OpenOptions::new().read(true).write(true).open(&path)?;
-                let map = unsafe { MmapOptions::new().map_mut(&f) }?;
-                let shared = Arc::new(Mutex::new(map));
-                *cached = Some(CachedArea {
-                    path: path.clone(),
-                    map: Arc::clone(&shared),
-                });
-                shared
-            }
-        };
+    fn with_area_rw<T>(
+        &self,
+        context: &str,
+        f: impl FnOnce(&mut MmapPropArea) -> SysPropResult<T>,
+    ) -> SysPropResult<T> {
+        let mut cache = self.area_cache.lock().map_err(|_| {
+            SysPropError::Io(io::Error::new(io::ErrorKind::Other, "area cache mutex poisoned"))
+        })?;
 
-        Ok(PropArea::new(MmapCursor::new(shared))?)
+        if !cache.contains_key(context) {
+            let area = self.map_context_area(context)?;
+            cache.insert(context.to_owned(), area);
+        }
+
+        let area = cache.get_mut(context).ok_or_else(|| {
+            SysPropError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("prop area not found for context: {context}"),
+            ))
+        })?;
+        f(area)
+    }
+
+    fn with_serial_area_rw<T>(
+        &self,
+        f: impl FnOnce(&mut MmapPropArea) -> SysPropResult<T>,
+    ) -> SysPropResult<T> {
+        let mut serial = self.serial_area.lock().map_err(|_| {
+            SysPropError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                "serial area mutex poisoned",
+            ))
+        })?;
+
+        if serial.is_none() {
+            *serial = Some(self.map_serial_area()?);
+        }
+
+        let area = serial.as_mut().ok_or_else(|| {
+            SysPropError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                "serial area initialization failed",
+            ))
+        })?;
+        f(area)
+    }
+
+    fn with_area_and_serial_rw<T>(
+        &self,
+        context: &str,
+        f: impl FnOnce(&mut MmapPropArea, &mut MmapPropArea) -> SysPropResult<T>,
+    ) -> SysPropResult<T> {
+        let mut cache = self.area_cache.lock().map_err(|_| {
+            SysPropError::Io(io::Error::new(io::ErrorKind::Other, "area cache mutex poisoned"))
+        })?;
+        if !cache.contains_key(context) {
+            let area = self.map_context_area(context)?;
+            cache.insert(context.to_owned(), area);
+        }
+        let area = cache.get_mut(context).ok_or_else(|| {
+            SysPropError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("prop area not found for context: {context}"),
+            ))
+        })?;
+
+        let mut serial = self.serial_area.lock().map_err(|_| {
+            SysPropError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                "serial area mutex poisoned",
+            ))
+        })?;
+        if serial.is_none() {
+            *serial = Some(self.map_serial_area()?);
+        }
+        let serial_area = serial.as_mut().ok_or_else(|| {
+            SysPropError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                "serial area initialization failed",
+            ))
+        })?;
+
+        f(area, serial_area)
     }
 }
 
@@ -416,92 +330,19 @@ fn appcompat_ctx() -> Option<&'static CachedPropertyContext> {
     APPCOMPAT_CTX.get().and_then(|opt| opt.as_ref())
 }
 
-// ── Futex helper ────────────────────────────────────────────────────────────
-
-/// Wake all threads waiting on a futex at the given shared-memory address.
+/// Bump the global `properties_serial` area and wake waiters.
 ///
-/// # Safety
-///
-/// `addr` must point to a valid, shared-memory `u32` (i.e. inside a
-/// `MAP_SHARED` mmap region).
-unsafe fn futex_wake(addr: *const u32) {
-    libc::syscall(
-        libc::SYS_futex,
-        addr,
-        libc::FUTEX_WAKE,
-        i32::MAX,
-        std::ptr::null::<libc::timespec>(),
-    );
-}
-
-/// Issue a futex wake for a prop's serial on a mapped prop-area.
-///
-/// # Safety
-///
-/// `base` must be the start of a shared-memory prop-area mmap.
-unsafe fn wake_prop_serial(base: *const u8, prop_offset: u32) {
-    let prop_serial_ptr = base
-        .add(PROP_AREA_HEADER_SIZE as usize)
-        .add(prop_offset as usize)
-        .add(PROP_INFO_SERIAL_OFFSET as usize) as *const u32;
-    futex_wake(prop_serial_ptr);
-}
-
-// ── Atomic helpers for mmap'd shared memory ─────────────────────────────────
-//
-// `PropArea<M>` writes serial fields through its generic `Write` impl, which
-// uses plain `copy_from_slice` — fine for regular files but **not** for
-// `MAP_SHARED` memory accessed concurrently by bionic readers in other
-// processes.  These helpers re-write serial values atomically with the correct
-// memory ordering, matching bionic's C++ `atomic_store_explicit` /
-// `atomic_load_explicit` usage.
-//
-// Safety invariant: all offsets passed to these functions must be 4-byte
-// aligned and within the mmap region.  This is guaranteed by the prop_area
-// layout (`repr(C)` structs with `u32` fields at natural alignment).
-
-/// Atomically store a `u32` at `base + offset` with `Release` ordering.
-///
-/// # Safety
-///
-/// `base + offset` must point to a valid, 4-byte-aligned `u32` within a
-/// `MAP_SHARED` mmap region.
-unsafe fn atomic_store_u32_release(base: *const u8, offset: usize, value: u32) {
-    let ptr = base.add(offset) as *const AtomicU32;
-    (*ptr).store(value, Ordering::Release);
-}
-
-/// Atomically load a `u32` from `base + offset` with `Relaxed` ordering.
-///
-/// # Safety
-///
-/// `base + offset` must point to a valid, 4-byte-aligned `u32` within a
-/// `MAP_SHARED` mmap region.
-unsafe fn atomic_load_u32_relaxed(base: *const u8, offset: usize) -> u32 {
-    let ptr = base.add(offset) as *const AtomicU32;
-    (*ptr).load(Ordering::Relaxed)
-}
-
-/// Bump the global `properties_serial` area serial and issue a futex wake.
-///
-/// In bionic, this is the serial returned by `__system_property_area_serial()`
-/// and waited on by `__system_property_wait(NULL, ...)`.  It lives in a
-/// **separate** prop-area file (`properties_serial`), not in the prop-area
-/// that contains the property being modified.
-///
-/// The bump uses the same pattern as bionic (`system_properties.cpp`):
-///   `atomic_store_explicit(serial, atomic_load_explicit(serial, relaxed) + 1, release)`
-/// This is safe because there is only a single mutator (property_service / resetprop).
+/// Matches bionic's Add() / Delete() pattern:
+/// ```cpp
+/// atomic_store_explicit(serial_pa->serial(),
+///     atomic_load_explicit(serial_pa->serial(), relaxed) + 1, release);
+/// __futex_wake(serial_pa->serial(), INT32_MAX);
+/// ```
 fn bump_and_wake_global_serial(ctx: &CachedPropertyContext) -> SysPropResult<()> {
-    let serial_area = ctx.open_serial_area_rw()?;
-    let cursor = serial_area.into_inner();
-    let serial_offset = AREA_SERIAL_OFFSET as usize;
-    unsafe {
-        let old = atomic_load_u32_relaxed(cursor.as_ptr(), serial_offset);
-        atomic_store_u32_release(cursor.as_ptr(), serial_offset, old.wrapping_add(1));
-        futex_wake(cursor.as_ptr().add(serial_offset) as *const u32);
-    }
-    Ok(())
+    ctx.with_serial_area_rw(|serial_area| {
+        serial_area.bump_area_serial_and_wake();
+        Ok(())
+    })
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -649,8 +490,9 @@ pub fn for_each(mut callback: impl FnMut(&str, &str)) {
 /// Set a property value.
 ///
 /// - For `ro.*` properties or when `skip_svc` is true: bypasses
-///   `property_service` and operates directly on the shared-memory mmap
-///   via `prop-rs`'s `PropArea::set_property`.
+///   `property_service` and writes directly to shared memory via
+///   [`MmapPropArea`], with serial publication following bionic's exact atomic
+///   ordering (see `system_properties.cpp` Update/Add).
 /// - For other properties: uses `__system_property_set` which goes through
 ///   init's `property_service` socket.
 pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
@@ -665,102 +507,22 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
     }
 
     if force_skip {
-        // Direct mmap write via prop-rs.
-        // For non-ro properties we bump the serial so that bionic waiters
-        // are notified; for ro properties we keep the serial unchanged to
-        // hide the modification.
-        let bump = !key.starts_with("ro.");
-
+        // Direct mmap write via mmap_prop_area writer protocol.
         let ctx = prop_ctx()?;
         let context = ctx.get_context_for_name(key);
-        let mut area = ctx.open_area_rw(context)?;
-        let result = area.set_property_with_serial(key, value, bump)?;
-        let cursor = area.into_inner();
-
-        // PropArea wrote the serial via plain copy_from_slice (the generic
-        // Write impl).  Re-write it atomically with Release ordering so that
-        // all preceding value bytes are visible to bionic readers before they
-        // observe the new serial.  This matches bionic's protocol:
-        //   atomic_thread_fence(memory_order_release);
-        //   atomic_store_explicit(&pi->serial, new_serial, memory_order_relaxed);
-        // We combine both into a single store(Release).
-        let prop_serial_offset = PROP_AREA_HEADER_SIZE as usize
-            + result.prop_offset as usize
-            + PROP_INFO_SERIAL_OFFSET as usize;
-        unsafe {
-            atomic_store_u32_release(cursor.as_ptr(), prop_serial_offset, result.serial);
-        }
-
-        if bump {
-            unsafe { wake_prop_serial(cursor.as_ptr(), result.prop_offset) };
-        }
-
-        if bump {
-            bump_and_wake_global_serial(ctx)?;
-
-            // Phase 3: restore the serial to its original counter value to
-            // hide the modification, matching bionic's Update():
-            //   atomic_thread_fence(memory_order_release);
-            //   new_serial = (len << 24) | ((serial & ~1) & 0xffffff);
-            //   atomic_store_explicit(&pi->serial, new_serial, relaxed);
-            // The bumped serial already woke futex waiters above; now we
-            // put the counter back so detection tools don't see a change.
-            //
-            // compose_serial(bump=true) produces:
-            //   bumped = (len << 24) | flags | (((old_counter | 1) + 1) & 0xffffff)
-            // bionic restores with:
-            //   restored = (len << 24) | flags | ((old_counter & ~1) & 0xffffff)
-            // Since (old|1)+1 = old+2 when bit0=0, or old+1 when bit0=1,
-            // and (old & ~1) = (old|1) - 1, we have:
-            //   restored_counter = bumped_counter - 2   (mod 2^24)
-            let restored_serial = (result.serial & 0xff00_0000)
-                | (result.serial.wrapping_sub(2) & 0x00ff_ffff);
-            unsafe {
-                atomic_store_u32_release(cursor.as_ptr(), prop_serial_offset, restored_serial);
-            }
-        }
+        ctx.with_area_and_serial_rw(context, |area, serial_area| {
+            area.upsert(key, value, serial_area)?;
+            Ok(())
+        })?;
 
         // Dual-write to appcompat_override area (Android 14+).
-        // If the key has the "ro.appcompat_override." prefix, strip it so that
-        // the appcompat area stores the property under its canonical name
-        // (e.g. "ro.foo" instead of "ro.appcompat_override.ro.foo").
         if let Some(appcompat) = appcompat_ctx() {
             let override_key = strip_appcompat_prefix(key);
             let ctx_name = appcompat.get_context_for_name(override_key);
-            if let Ok(mut area) = appcompat.open_area_rw(ctx_name) {
-                let result = area.set_property_with_serial(override_key, value, bump);
-                let cursor = area.into_inner();
-                if let Ok(r) = &result {
-                    // Atomic re-write of the appcompat prop serial.
-                    let ac_serial_offset = PROP_AREA_HEADER_SIZE as usize
-                        + r.prop_offset as usize
-                        + PROP_INFO_SERIAL_OFFSET as usize;
-                    unsafe {
-                        atomic_store_u32_release(cursor.as_ptr(), ac_serial_offset, r.serial);
-                    }
-                    if bump {
-                        unsafe { wake_prop_serial(cursor.as_ptr(), r.prop_offset) };
-                    }
-                }
-
-                if bump {
-                    let _ = bump_and_wake_global_serial(appcompat);
-
-                    // Phase 3: restore appcompat prop serial (same as main area).
-                    if let Ok(r) = &result {
-                        let ac_serial_offset = PROP_AREA_HEADER_SIZE as usize
-                            + r.prop_offset as usize
-                            + PROP_INFO_SERIAL_OFFSET as usize;
-                        let restored = (r.serial & 0xff00_0000)
-                            | (r.serial.wrapping_sub(2) & 0x00ff_ffff);
-                        unsafe {
-                            atomic_store_u32_release(cursor.as_ptr(), ac_serial_offset, restored);
-                        }
-                    }
-                }
-            } else if bump {
-                let _ = bump_and_wake_global_serial(appcompat);
-            }
+            let _ = appcompat.with_area_and_serial_rw(ctx_name, |ov_area, serial_area| {
+                ov_area.upsert(override_key, value, serial_area)?;
+                Ok(())
+            });
         }
     } else {
         // Go through bionic's property_service socket.
@@ -775,7 +537,7 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
     Ok(())
 }
 
-/// Delete a property from shared memory via `prop-rs`.
+/// Delete a property from shared memory.
 ///
 /// Returns `true` if the property existed and was deleted.
 ///
@@ -784,8 +546,7 @@ pub fn set(key: &str, value: &str, skip_svc: bool) -> SysPropResult<()> {
 pub fn delete(key: &str) -> SysPropResult<bool> {
     let ctx = prop_ctx()?;
     let context = ctx.get_context_for_name(key);
-    let mut area = ctx.open_area_rw(context)?;
-    let deleted = area.delete_property(key)?;
+    let deleted = ctx.with_area_rw(context, |area| Ok(area.remove(key)?))?;
 
     if deleted {
         let _ = bump_and_wake_global_serial(ctx);
@@ -795,9 +556,7 @@ pub fn delete(key: &str) -> SysPropResult<bool> {
     if let Some(appcompat) = appcompat_ctx() {
         let override_key = strip_appcompat_prefix(key);
         let ctx_name = appcompat.get_context_for_name(override_key);
-        if let Ok(mut area) = appcompat.open_area_rw(ctx_name) {
-            let _ = area.delete_property(override_key);
-        }
+        let _ = appcompat.with_area_rw(ctx_name, |ov_area| Ok(ov_area.remove(override_key)?));
 
         if deleted {
             let _ = bump_and_wake_global_serial(appcompat);
@@ -830,32 +589,34 @@ pub fn compact(context: Option<&str>) -> SysPropResult<bool> {
 }
 
 fn compact_areas(ctx: &CachedPropertyContext, filter: Option<&str>) -> SysPropResult<bool> {
+    use std::io::Cursor;
+    use prop_rs::PropArea;
+
+    // Helper: compact one prop-area file via MAP_SHARED mmap.
+    fn compact_one(path: &std::path::Path) -> io::Result<bool> {
+        let f = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut map = unsafe { MmapOptions::new().map_mut(&f) }?;
+        let cursor = Cursor::new(&mut map[..]);
+        let mut area =
+            PropArea::new(cursor).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let result = area
+            .compact_allocations()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(!matches!(result, prop_rs::CompactResult::NoHoles))
+    }
+
     let mut any_compacted = false;
 
     if let Some(context) = filter {
-        let mut area = ctx.open_area_rw(context)?;
-        match area.compact_allocations() {
-            Ok(result) => {
-                if !matches!(result, prop_rs::CompactResult::NoHoles) {
-                    any_compacted = true;
-                }
-            }
-            Err(_) => {}
+        let path = ctx.ctx.context_file_path(context);
+        if let Ok(changed) = compact_one(&path) {
+            any_compacted |= changed;
         }
     } else {
         let targets = ctx.prop_area_files().map_err(SysPropError::Io)?;
-        for (context, _path) in &targets {
-            let mut area = match ctx.open_area_rw(context) {
-                Ok(area) => area,
-                Err(_) => continue,
-            };
-            match area.compact_allocations() {
-                Ok(result) => {
-                    if !matches!(result, prop_rs::CompactResult::NoHoles) {
-                        any_compacted = true;
-                    }
-                }
-                Err(_) => continue,
+        for (_context, path) in &targets {
+            if let Ok(changed) = compact_one(path) {
+                any_compacted |= changed;
             }
         }
     }

@@ -95,7 +95,7 @@ fn delete_prunes_only_removed_branch() {
 }
 
 #[test]
-fn update_inline_keeps_serial_and_clears_trailing_bytes() {
+fn update_inline_bumps_serial_and_clears_trailing_bytes() {
     let key = "ro.inline.serial";
     let old_value = "ABCDEFGHIJ";
     let new_value = "abc";
@@ -116,9 +116,10 @@ fn update_inline_keeps_serial_and_clears_trailing_bytes() {
 
     let raw_after = area.into_inner().into_inner();
     let serial_after = read_serial(&raw_after, after.prop_offset);
-    // High 8 bits encode new value length; low 24 bits preserved from original
-    // serial to hide modification traces (Magisk-compatible behaviour).
-    let expected_serial = ((new_value.len() as u32) << 24) | (serial_before & 0x00ff_ffff);
+    // High 8 bits encode new value length; low 24 bits follow bionic Update():
+    // ((old|1)+1)&0xffffff.
+    let expected_counter = (((serial_before & 0x00ff_ffff) | 1) + 1) & 0x00ff_ffff;
+    let expected_serial = ((new_value.len() as u32) << 24) | expected_counter;
     assert_eq!(serial_after, expected_serial);
 
     let value_abs = data_abs(after.value_offset);
@@ -132,7 +133,7 @@ fn update_inline_keeps_serial_and_clears_trailing_bytes() {
 }
 
 #[test]
-fn update_long_keeps_serial_and_updates_in_place() {
+fn update_long_bumps_serial_and_updates_in_place() {
     let key = "persist.sys.long.serial";
     let old_value = "x".repeat(140);
     let new_value = "y".repeat(40);
@@ -153,7 +154,9 @@ fn update_long_keeps_serial_and_updates_in_place() {
 
     let raw_after = area.into_inner().into_inner();
     let serial_after = read_serial(&raw_after, after.prop_offset);
-    assert_eq!(serial_after, serial_before);
+    let expected_counter = (((serial_before & 0x00ff_ffff) | 1) + 1) & 0x00ff_ffff;
+    let expected_serial = (serial_before & 0xff00_0000) | expected_counter;
+    assert_eq!(serial_after, expected_serial);
 
     let value_abs = data_abs(after.value_offset);
     assert_eq!(&raw_after[value_abs..value_abs + new_value.len()], new_value.as_bytes());
