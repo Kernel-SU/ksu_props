@@ -242,7 +242,11 @@ dependencies = [
 name = "resetprop"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
+ "libc",
+ "log",
+ "memmap2",
  "prop-rs",
  "prop-rs-android",
 ]

@@ -129,6 +129,14 @@ impl std::error::Error for MmapPropAreaError {}
 
 pub type MmapResult<T> = Result<T, MmapPropAreaError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueSlotInspect {
+    pub is_long:      bool,
+    pub value_len:    usize,
+    pub tail_size:    usize,
+    pub tail_nonzero: usize,
+}
+
 
 // ── MmapPropArea ─────────────────────────────────────────────────────────────
 
@@ -577,6 +585,51 @@ impl MmapPropArea {
     /// Read the serial of a `prop_info` at data-space `data_off`.
     pub fn read_serial(&self, data_off: u32) -> u32 {
         unsafe { self.read_pi_serial_relaxed(data_off) }
+    }
+
+    /// Inspect the current value-slot state for a property.
+    ///
+    /// For inline properties, `tail_*` describes `value[len..PROP_VALUE_MAX]`.
+    /// For long properties, the inline slot is not relevant, so `tail_*` is zero.
+    pub fn inspect_value_slot(&mut self, name: &str) -> MmapResult<Option<ValueSlotInspect>> {
+        let Some(data_off) = self.find(name)? else {
+            return Ok(None);
+        };
+
+        let serial = unsafe { self.read_pi_serial_relaxed(data_off) };
+        let is_long = (serial & PROP_INFO_LONG_FLAG) != 0;
+
+        if is_long {
+            let loff = unsafe { self.read_u32_data(data_off + PROP_INFO_LONG_OFFSET_OFF)? };
+            let lv_abs = PROP_AREA_HEADER_SIZE as usize + (data_off + loff) as usize;
+            let value_len = unsafe {
+                libc::strlen(self.as_ptr().add(lv_abs) as *const libc::c_char)
+            };
+            return Ok(Some(ValueSlotInspect {
+                is_long: true,
+                value_len,
+                tail_size: 0,
+                tail_nonzero: 0,
+            }));
+        }
+
+        let value_len = ((serial >> 24) as usize).min(PROP_VALUE_MAX);
+        let val_abs = PROP_AREA_HEADER_SIZE as usize
+            + data_off as usize
+            + PROP_INFO_VALUE_OFF as usize;
+        let tail = unsafe {
+            std::slice::from_raw_parts(
+                self.as_ptr().add(val_abs + value_len),
+                PROP_VALUE_MAX - value_len,
+            )
+        };
+
+        Ok(Some(ValueSlotInspect {
+            is_long: false,
+            value_len,
+            tail_size: tail.len(),
+            tail_nonzero: tail.iter().filter(|&&b| b != 0).count(),
+        }))
     }
 
     /// Add a new property and publish serial changes using bionic's writer protocol.

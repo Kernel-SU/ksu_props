@@ -7,7 +7,15 @@ edition = "2021"
 name = "resetprop"
 path = "src/main.rs"
 
+[[bin]]
+name = "resetprop-test-helper"
+path = "src/test_main.rs"
+
 [dependencies]
 prop-rs = { path = "../../crates/prop-rs" }
 prop-rs-android = { path = "../../crates/prop-rs-android" }
+libc = "0.2"
+memmap2 = "0.9"
+anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+log = "0.4"

@@ -8,8 +8,8 @@ name = "cargo-android-sysprop"
 path = "src/main.rs"
 
 [[bin]]
-name = "cargo-android-resetprop"
-path = "src/resetprop.rs"
+name = "resetprop-tester"
+path = "src/resetprop-tester.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

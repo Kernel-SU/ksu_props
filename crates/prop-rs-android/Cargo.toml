@@ -3,10 +3,6 @@ name = "prop-rs-android"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "resetprop"
-path = "src/bin/resetprop.rs"
-
 [dependencies]
 prop-rs = { path = "../prop-rs" }
 libc = "0.2"

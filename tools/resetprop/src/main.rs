@@ -1,53 +1,27 @@
-//! `resetprop` — Magisk-compatible system property tool for Android.
-//!
-//! This binary is a thin CLI wrapper around [`prop_rs_android::resetprop`].
-//!
-//! # Usage
-//!
-//! ```text
-//! resetprop [flags] [name [value]]
-//!
-//! Read:
-//!   resetprop                        List all properties
-//!   resetprop name                   Get property value
-//!
-//! Write:
-//!   resetprop name value             Set property (non-ro.* via property_service)
-//!   resetprop -n name value          Skip property_service, direct mmap
-//!   -f, --file FILE                  Load and set properties from FILE
-//!
-//! Delete:
-//!   resetprop -d name                Delete property
-//!
-//! Wait:
-//!   resetprop -w name                Wait for property to exist
-//!   resetprop -w name value          Wait until property differs from value
-//!
-//! Compact:
-//!   resetprop -c                     Compact all property areas
-//!   resetprop -c context             Compact only the specified SELinux context
-//!
-//! Flags:
-//!   -n          Skip property_service (force direct mmap for all properties)
-//!   -p          Also operate on persistent property storage
-//!   -P          Only read persistent properties from storage
-//!   -c          Compact property area memory (optionally specify a context)
-//!   -d          Delete mode
-//!   -v          Verbose output
-//!   -w          Wait mode
-//!   --timeout N Wait timeout in seconds (default: infinite)
-//!   -Z          Show SELinux context for each property when listing
-//! ```
-
-use std::fs::File;
-use std::io::BufRead;
-use std::process;
-use std::time::Duration;
-
+use anyhow::{bail, Context, Result};
+use clap::error::ErrorKind;
 use clap::Parser;
-
+use log::info;
 use prop_rs_android::resetprop::ResetProp;
 use prop_rs_android::sys_prop;
+use std::fmt;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::time::Duration;
+
+#[derive(Debug)]
+struct WaitTimeoutError {
+    name: String,
+}
+
+impl fmt::Display for WaitTimeoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "timeout waiting for {}", self.name)
+    }
+}
+
+impl std::error::Error for WaitTimeoutError {}
 
 /// Magisk-compatible Android system property tool.
 #[derive(Parser)]
@@ -57,6 +31,7 @@ use prop_rs_android::sys_prop;
     about = "Magisk-compatible system property tool",
     disable_help_subcommand = true
 )]
+#[allow(clippy::struct_excessive_bools)]
 struct Args {
     /// Skip property_service (force direct mmap operation).
     #[arg(short = 'n', long = "skip-svc")]
@@ -78,7 +53,7 @@ struct Args {
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 
-    /// Wait for a property to exist or change.
+    /// Wait for a property to exist or match a value.
     #[arg(short = 'w', long = "wait")]
     wait: bool,
 
@@ -107,117 +82,152 @@ struct Args {
 }
 
 fn main() {
-    let args = Args::parse();
-
-    if let Err(e) = sys_prop::init() {
-        eprintln!("resetprop: {e}");
-        process::exit(1);
-    }
-
-    let rp = ResetProp {
-        skip_svc: args.skip_svc,
-        persistent: args.persistent,
-        persist_only: args.persist_only,
-        verbose: args.verbose,
-        show_context: args.show_context,
-    };
-
-    if let Err(e) = run(&args, &rp) {
-        eprintln!("resetprop: {e}");
-        process::exit(1);
+    if let Err(err) = run_from_args(&std::env::args().collect::<Vec<_>>()) {
+        let code = if err.downcast_ref::<WaitTimeoutError>().is_some() {
+            2
+        } else {
+            1
+        };
+        eprintln!("resetprop: {err:#}");
+        std::process::exit(code);
     }
 }
 
-fn run(args: &Args, rp: &ResetProp) -> Result<(), Box<dyn std::error::Error>> {
-    // Validate: at most one special mode.
-    let special_modes =
-        args.wait as u8 + args.delete as u8 + args.compact as u8 + args.file.is_some() as u8;
+/// Entry point for resetprop multicall and subcommand.
+///
+/// `args` should include argv[0] (the program name).
+pub fn run_from_args(args: &[String]) -> Result<()> {
+    let cli = match Args::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(err) => {
+            if matches!(err.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                err.print()?;
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!("{err}"));
+        }
+    };
+
+    sys_prop::init().context("Failed to initialize system property API")?;
+
+    let rp = ResetProp {
+        skip_svc: cli.skip_svc,
+        persistent: cli.persistent,
+        persist_only: cli.persist_only,
+        verbose: cli.verbose,
+        show_context: cli.show_context,
+    };
+
+    // Validate: at most one special mode
+    let special_modes = u8::from(cli.wait)
+        + u8::from(cli.delete)
+        + u8::from(cli.compact)
+        + u8::from(cli.file.is_some());
     if special_modes > 1 {
-        return Err("multiple operation modes detected".into());
+        bail!("multiple operation modes detected");
     }
 
     // -w: wait mode
-    if args.wait {
-        let name = args
+    if cli.wait {
+        let name = cli
             .name
             .as_deref()
-            .ok_or("--wait requires a property name")?;
-        let timeout = args.timeout.map(Duration::from_secs_f64);
-        let ok = rp.wait(name, args.value.as_deref(), timeout)?;
+            .context("--wait requires a property name")?;
+        let timeout = cli.timeout.map(Duration::from_secs_f64);
+        let ok = rp
+            .wait(name, cli.value.as_deref(), timeout)
+            .context("wait failed")?;
         if !ok {
-            eprintln!("resetprop: timeout waiting for {name}");
-            process::exit(2);
+            return Err(WaitTimeoutError {
+                name: name.to_owned(),
+            }
+            .into());
         }
         return Ok(());
     }
 
     // -c: compact property area memory
     // When a positional argument is given, treat it as a SELinux context name.
-    if args.compact {
-        let context = args.name.as_deref();
-        let compacted = sys_prop::compact(context)?;
+    if cli.compact {
+        let context = cli.name.as_deref();
+        let compacted = sys_prop::compact(context).context("compact failed")?;
         if !compacted {
-            if args.verbose {
-                eprintln!("resetprop: nothing to compact");
-            }
-            process::exit(1);
+            bail!("nothing to compact");
         }
         return Ok(());
     }
 
     // -f: load from file
-    if let Some(path) = &args.file {
-        let file = File::open(path)?;
-        let reader = std::io::BufReader::new(file);
-        rp.load_props(reader.lines())?;
+    if let Some(path) = &cli.file {
+        let file = File::open(path).with_context(|| format!("Failed to open {path}"))?;
+        let reader = BufReader::new(file);
+        rp.load_props(reader.lines())
+            .context("Failed to load properties from file")?;
         return Ok(());
     }
 
     // -d: delete
-    if args.delete {
-        let name = args
+    if cli.delete {
+        let name = cli
             .name
             .as_deref()
-            .ok_or("--delete requires a property name")?;
-        let deleted = rp.delete(name)?;
+            .context("--delete requires a property name")?;
+        let deleted = rp.delete(name).context("delete failed")?;
         if !deleted {
-            process::exit(1);
+            bail!("{name} not found");
         }
         return Ok(());
     }
 
-    match (&args.name, &args.value) {
-        // resetprop name value  (set)
+    match (&cli.name, &cli.value) {
+        // resetprop name value (set)
         (Some(name), Some(value)) => {
-            rp.set(name, value)?;
+            rp.set(name, value)
+                .with_context(|| format!("Failed to set {name}"))?;
         }
 
-        // resetprop name  (get)
-        (Some(name), None) => {
-            match rp.get(name) {
-                Some(val) => println!("{val}"),
-                None => {
-                    if args.verbose {
-                        eprintln!("resetprop: {name} not found");
-                    }
-                    process::exit(1);
-                }
-            }
-        }
+        // resetprop name (get)
+        (Some(name), None) => match rp.get(name) {
+            Some(val) => println!("{val}"),
+            None => bail!("{name} not found"),
+        },
 
-        // resetprop  (list all)
+        // resetprop (list all)
         (None, None) => {
-            let props = rp.list_all()?;
+            let props = rp.list_all().context("Failed to list properties")?;
             for (name, value) in &props {
                 println!("[{name}]: [{value}]");
             }
         }
 
-        // resetprop <no name> <value>  — invalid
+        // resetprop <no name> <value> — invalid
         (None, Some(_)) => {
-            return Err("property name is required".into());
+            bail!("property name is required");
         }
     }
 
+    Ok(())
+}
+
+/// Load system.prop file using internal resetprop API.
+///
+/// Equivalent to `resetprop -n --file <path>`.
+pub fn load_system_prop_file(path: &Path) -> Result<()> {
+    sys_prop::init().context("Failed to initialize system property API")?;
+
+    let rp = ResetProp {
+        skip_svc: true,
+        persistent: false,
+        persist_only: false,
+        verbose: false,
+        show_context: false,
+    };
+
+    let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    rp.load_props(reader.lines())
+        .with_context(|| format!("Failed to load properties from {}", path.display()))?;
+
+    info!("Loaded system.prop from {}", path.display());
     Ok(())
 }

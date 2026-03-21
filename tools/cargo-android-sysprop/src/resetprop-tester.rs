@@ -21,7 +21,7 @@ impl BuildProfile {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "cargo-android-resetprop",
+    name = "resetprop-tester",
     about = "Build Android resetprop, deploy to /data/local/tmp via adb, and optionally run tests via su -c"
 )]
 struct Args {
@@ -39,6 +39,10 @@ struct Args {
     /// Remote path to deploy resetprop
     #[arg(long, default_value = "/data/local/tmp/resetprop")]
     remote: String,
+
+    /// Remote path to deploy resetprop-test when running tests.
+    #[arg(long, default_value = "/data/local/tmp/resetprop-test-helper")]
+    remote_test_helper: String,
 
     /// adb executable path
     #[arg(long, default_value = "adb")]
@@ -63,7 +67,7 @@ struct Args {
     /// Command executed by `adb shell su -c '<COMMAND>'`.
     ///
     /// If omitted and tests are enabled, defaults to:
-    /// `RESETPROP=<remote> sh <remote_test_script>`
+    /// `RESETPROP=<remote> RESETPROP_TEST=<remote_test_helper> sh <remote_test_script>`
     #[arg(long)]
     test_cmd: Option<String>,
 }
@@ -128,7 +132,7 @@ fn run() -> Result<()> {
         .arg(&ndk_abi)
         .arg("build")
         .arg("-p")
-        .arg("prop-rs-android")
+        .arg("resetprop")
         .arg("--bin")
         .arg("resetprop")
         .stdin(Stdio::inherit())
@@ -140,6 +144,26 @@ fn run() -> Result<()> {
     }
 
     run_checked(&mut cargo_build, "cargo ndk build")?;
+
+    if args.run_test || args.test_cmd.is_some() {
+        println!("building test helper");
+        let mut cargo_build_helper = Command::new(&args.cargo);
+        cargo_build_helper.arg("ndk")
+            .arg("-t")
+            .arg(&ndk_abi)
+            .arg("build")
+            .arg("-p")
+            .arg("resetprop")
+            .arg("--bin")
+            .arg("resetprop-test-helper")
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if matches!(args.profile, BuildProfile::Release) {
+            cargo_build_helper.arg("--release");
+        }
+        run_checked(&mut cargo_build_helper, "cargo ndk build helper")?;
+    }
 
     let local_bin = PathBuf::from("target")
         .join(&rust_target)
@@ -172,6 +196,40 @@ fn run() -> Result<()> {
     run_checked(&mut adb_chmod, "adb shell chmod")?;
 
     if args.run_test || args.test_cmd.is_some() {
+        let local_test_helper = PathBuf::from("target")
+            .join(&rust_target)
+            .join(args.profile.as_dir())
+            .join("resetprop-test-helper");
+
+        if !local_test_helper.exists() {
+            return Err(format!(
+                "built helper binary not found: {}",
+                local_test_helper.display()
+            )
+            .into());
+        }
+
+        let mut adb_push_helper = adb_base(&args);
+        adb_push_helper
+            .arg("push")
+            .arg(&local_test_helper)
+            .arg(&args.remote_test_helper)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        run_checked(&mut adb_push_helper, "adb push resetprop-test-helper")?;
+
+        let mut adb_chmod_helper = adb_base(&args);
+        adb_chmod_helper
+            .arg("shell")
+            .arg("chmod")
+            .arg("+x")
+            .arg(&args.remote_test_helper)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        run_checked(&mut adb_chmod_helper, "adb shell chmod resetprop-test-helper")?;
+
         let local_test_script = PathBuf::from(&args.test_script);
         if !local_test_script.exists() {
             return Err(format!(
@@ -205,7 +263,12 @@ fn run() -> Result<()> {
         let cmd = args
             .test_cmd
             .clone()
-            .unwrap_or_else(|| format!("RESETPROP={} sh {}", args.remote, args.remote_test_script));
+            .unwrap_or_else(|| {
+                format!(
+                    "RESETPROP={} RESETPROP_TEST_HELPER={} sh {}",
+                    args.remote, args.remote_test_helper, args.remote_test_script
+                )
+            });
 
         let mut adb_test = adb_base(&args);
         adb_test

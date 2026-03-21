@@ -15,6 +15,7 @@ use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io;
+use std::io::Cursor;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
@@ -22,10 +23,10 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use memmap2::MmapOptions;
-use prop_rs::{PropertyContext, PROP_VALUE_MAX};
+use prop_rs::{PropArea, PropAreaHoleInfo, PropertyContext, PROP_VALUE_MAX};
 
 use crate::mmap_prop_area::{
-    MmapPropArea, MmapPropAreaError,
+    MmapPropArea, MmapPropAreaError, ValueSlotInspect as MmapValueSlotInspect,
 };
 
 // ── Error type ──────────────────────────────────────────────────────────────
@@ -95,6 +96,27 @@ impl From<io::Error> for SysPropError {
 }
 
 pub type SysPropResult<T> = std::result::Result<T, SysPropError>;
+
+#[derive(Debug, Clone)]
+pub struct PropAreaValueInspect {
+    pub context:      String,
+    pub path:         PathBuf,
+    pub is_long:      bool,
+    pub value_len:    usize,
+    pub tail_size:    usize,
+    pub tail_nonzero: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PropAreaScanReport {
+    pub context:          String,
+    pub path:             PathBuf,
+    pub bytes_used:       u32,
+    pub has_dirty_backup: bool,
+    pub object_count:     usize,
+    pub hole_count:       usize,
+    pub holes:            Vec<PropAreaHoleInfo>,
+}
 
 // ── Opaque prop_info pointer ────────────────────────────────────────────────
 
@@ -441,6 +463,65 @@ pub fn get_context(key: &str) -> SysPropResult<String> {
     Ok(ctx.get_context_for_name(key).to_string())
 }
 
+/// Resolve the backing prop-area file path for a property name.
+pub fn area_path(key: &str) -> SysPropResult<PathBuf> {
+    let ctx = prop_ctx()?;
+    let context = ctx.get_context_for_name(key);
+    Ok(ctx.ctx.context_file_path(context))
+}
+
+/// Inspect the current storage state of a property's value slot.
+pub fn inspect_value_slot(key: &str) -> SysPropResult<Option<PropAreaValueInspect>> {
+    let ctx = prop_ctx()?;
+    let context = ctx.get_context_for_name(key).to_string();
+    let path = ctx.ctx.context_file_path(&context);
+
+    ctx.with_area_rw(&context, |area| {
+        Ok(area.inspect_value_slot(key)?.map(|inspect| {
+            let MmapValueSlotInspect {
+                is_long,
+                value_len,
+                tail_size,
+                tail_nonzero,
+            } = inspect;
+            PropAreaValueInspect {
+                context: context.clone(),
+                path: path.clone(),
+                is_long,
+                value_len,
+                tail_size,
+                tail_nonzero,
+            }
+        }))
+    })
+}
+
+/// Scan allocations in the property's backing prop-area file.
+pub fn scan_area(key: &str) -> SysPropResult<PropAreaScanReport> {
+    let ctx = prop_ctx()?;
+    let context = ctx.get_context_for_name(key).to_string();
+    let path = ctx.ctx.context_file_path(&context);
+
+    let file = OpenOptions::new().read(true).write(true).open(&path)?;
+    let mut map = unsafe { MmapOptions::new().map_mut(&file) }?;
+    let cursor = Cursor::new(&mut map[..]);
+    let mut area =
+        PropArea::new(cursor).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let scan = area
+        .scan_allocations()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+    Ok(PropAreaScanReport {
+        context,
+        path,
+        bytes_used: scan.bytes_used,
+        has_dirty_backup: scan.has_dirty_backup,
+        object_count: scan.objects.len(),
+        hole_count: scan.holes.len(),
+        holes: scan.holes,
+    })
+}
+
 /// Iterate over all properties.
 pub fn for_each(mut callback: impl FnMut(&str, &str)) {
     // We need a double indirection: for_each gives us pi, then we read_callback
@@ -589,9 +670,6 @@ pub fn compact(context: Option<&str>) -> SysPropResult<bool> {
 }
 
 fn compact_areas(ctx: &CachedPropertyContext, filter: Option<&str>) -> SysPropResult<bool> {
-    use std::io::Cursor;
-    use prop_rs::PropArea;
-
     // Helper: compact one prop-area file via MAP_SHARED mmap.
     fn compact_one(path: &std::path::Path) -> io::Result<bool> {
         let f = OpenOptions::new().read(true).write(true).open(path)?;

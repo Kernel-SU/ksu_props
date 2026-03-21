@@ -6,13 +6,16 @@
 # 用法:
 #   adb push test_resetprop.sh /data/local/tmp/
 #   adb push resetprop /data/local/tmp/
+#   adb push resetprop-test-helper /data/local/tmp/
 #   adb shell su -c "sh /data/local/tmp/test_resetprop.sh"
 #
-# 或者指定 resetprop 路径:
-#   RESETPROP=/data/local/tmp/resetprop sh /data/local/tmp/test_resetprop.sh
+# 或者指定二进制路径:
+#   RESETPROP=/data/local/tmp/resetprop \
+#   RESETPROP_TEST_HELPER=/data/local/tmp/resetprop-test-helper \
+#   sh /data/local/tmp/test_resetprop.sh
 #
 # 调试模式（显示每条 set/get 命令及其结果）:
-#   DEBUG=1 RESETPROP=./resetprop sh test_resetprop.sh
+#   DEBUG=1 RESETPROP=./resetprop RESETPROP_TEST_HELPER=./resetprop-test-helper sh test_resetprop.sh
 # ============================================================================
 
 set -u
@@ -20,6 +23,7 @@ set -u
 # ── 配置 ────────────────────────────────────────────────────────────────────
 
 RESETPROP="${RESETPROP:-./resetprop}"
+RESETPROP_TEST_HELPER="${RESETPROP_TEST_HELPER:-/data/local/tmp/resetprop-test-helper}"
 DEBUG="${DEBUG:-0}"
 # 测试属性前缀，使用不常见的名称避免与系统属性冲突
 TEST_PREFIX="test.resetprop.$$"
@@ -92,9 +96,17 @@ rp_get() {
 # serial 查询：输出 "<counter> <len>"
 _rp_serial_tmp="${TMP}/_rp_serial_$$"
 rp_serial() {
-    "$RESETPROP" --serial "$1" >"$_rp_serial_tmp" 2>/dev/null
+    "$RESETPROP_TEST_HELPER" --serial "$1" >"$_rp_serial_tmp" 2>/dev/null
     local rc=$?
     cat "$_rp_serial_tmp"
+    return $rc
+}
+
+_rp_test_tmp="${TMP}/_rp_test_$$"
+rp_test() {
+    "$RESETPROP_TEST_HELPER" "$@" >"$_rp_test_tmp" 2>/dev/null
+    local rc=$?
+    cat "$_rp_test_tmp"
     return $rc
 }
 
@@ -149,6 +161,17 @@ assert_contains() {
     rm -f "${TMP}/_rp_assert_$$"
 }
 
+assert_not_contains() {
+    local desc="$1" needle="$2" haystack="$3"
+    printf '%s' "$haystack" > "${TMP}/_rp_assert_$$"
+    if grep -qF "$needle" "${TMP}/_rp_assert_$$" 2>/dev/null; then
+        log_fail "$desc" "does not contain '$needle'" "(found)"
+    else
+        log_pass "$desc"
+    fi
+    rm -f "${TMP}/_rp_assert_$$"
+}
+
 # 断言：命令成功（退出码 0）
 assert_success() {
     local desc="$1"
@@ -175,6 +198,12 @@ assert_failure() {
     fi
 }
 
+stat_times() {
+    stat "$1" 2>/dev/null | sed -n \
+        -e 's/^[[:space:]]*Modify: //p' \
+        -e 's/^[[:space:]]*Change: //p'
+}
+
 # ── 前置检查 ──────────────────────────────────────────────────────────────
 
 section "前置检查"
@@ -190,12 +219,24 @@ if [ ! -x "$RESETPROP" ]; then
     fi
 fi
 
+if [ ! -x "$RESETPROP_TEST_HELPER" ]; then
+    if command -v resetprop-test-helper >/dev/null 2>&1; then
+        RESETPROP_TEST_HELPER="$(command -v resetprop-test-helper)"
+        printf "  使用 PATH 中的 resetprop-test-helper: %s\n" "$RESETPROP_TEST_HELPER"
+    else
+        printf "${RED}  错误: resetprop-test-helper 不存在或不可执行: %s${NC}\n" "$RESETPROP_TEST_HELPER"
+        printf "  请设置 RESETPROP_TEST_HELPER 环境变量或将 resetprop-test-helper 放到当前目录\n"
+        exit 1
+    fi
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
     printf "${RED}  错误: 需要 root 权限${NC}\n"
     exit 1
 fi
 
 printf "  resetprop 路径: %s\n" "$RESETPROP"
+printf "  resetprop-test-helper 路径: %s\n" "$RESETPROP_TEST_HELPER"
 printf "  测试属性前缀: %s\n" "$TEST_PREFIX"
 printf "  PID: %s\n" "$$"
 
@@ -226,9 +267,12 @@ trap cleanup EXIT
 for name in basic overwrite empty special maxlen long \
             file1 file2 file3 wait wait_change \
             compact1 compact2 compact3 \
+            trace_inline mtime \
             serial_add serial_len; do
     register_cleanup "${TEST_PREFIX}.${name}"
 done
+register_cleanup "${TEST_PREFIX}.hole.aa"
+register_cleanup "${TEST_PREFIX}.hole.bb"
 for i in 1 2 3 4 5; do
     register_cleanup "${TEST_PREFIX}.concurrent_$i"
 done
@@ -678,6 +722,56 @@ if [ $rc -eq 0 ] || [ $rc -eq 1 ]; then
     log_pass "10.3 指定 context 压缩成功"
 else
     log_fail "10.3 指定 context 压缩" "exit=0 or 1" "exit=$rc"
+fi
+
+# ============================================================================
+# 测试组 10A: 写入痕迹检查
+# ============================================================================
+
+section "10A. 写入痕迹检查"
+
+# 10A.1 inline 值缩短后尾部不应残留非零字节
+assert_success "10A.1a 设置较长 inline 值" rp_set -n "${TEST_PREFIX}.trace_inline" "abcdefgh"
+assert_success "10A.1b 将 inline 值缩短" rp_set -n "${TEST_PREFIX}.trace_inline" "abc"
+val=$(rp_get "${TEST_PREFIX}.trace_inline")
+assert_eq "10A.1c 缩短后读取值正确" "abc" "$val"
+slot_info=$(rp_test --inspect-slot "${TEST_PREFIX}.trace_inline")
+assert_contains "10A.1d inspect 识别为 inline" "layout=inline" "$slot_info"
+assert_contains "10A.1e inline 尾部无非零字节" "tail_nonzero=0" "$slot_info"
+
+# 10A.2 delete 产生 hole，compact 后 hole 应消失
+hole_context=$(rp_get -Z "${TEST_PREFIX}.hole.bb")
+if [ -n "$hole_context" ]; then
+    $RESETPROP -c "$hole_context" >/dev/null 2>&1
+    baseline_scan=$(rp_test --scan "${TEST_PREFIX}.hole.bb")
+    assert_contains "10A.2a 基线 scan 无 hole" "holes=0" "$baseline_scan"
+
+    assert_success "10A.2b 设置 hole.aa" rp_set -n "${TEST_PREFIX}.hole.aa" "value_aa"
+    assert_success "10A.2c 设置 hole.bb" rp_set -n "${TEST_PREFIX}.hole.bb" "value_bb"
+    assert_success "10A.2d 删除 hole.aa" $RESETPROP -d "${TEST_PREFIX}.hole.aa"
+
+    hole_scan=$(rp_test --scan "${TEST_PREFIX}.hole.bb")
+    assert_not_contains "10A.2e 删除后 scan 出现 hole" "holes=0" "$hole_scan"
+
+    $RESETPROP -c "$hole_context" >/dev/null 2>&1
+    compact_scan=$(rp_test --scan "${TEST_PREFIX}.hole.bb")
+    assert_contains "10A.2f compact 后 hole 消失" "holes=0" "$compact_scan"
+
+    val=$(rp_get "${TEST_PREFIX}.hole.bb")
+    assert_eq "10A.2g compact 后剩余属性仍可读" "value_bb" "$val"
+else
+    log_fail "10A.2 hole 测试获取 context" "non-empty context" "(empty)"
+fi
+
+# 10A.3 prop area 文件 mtime/ctime 在写入前后不应改变
+area_path=$(rp_test --area-path "${TEST_PREFIX}.mtime")
+if [ -n "$area_path" ] && [ -e "$area_path" ]; then
+    stat_before=$(stat_times "$area_path")
+    assert_success "10A.3a 执行 direct mmap 写入" rp_set -n "${TEST_PREFIX}.mtime" "mtime_check"
+    stat_after=$(stat_times "$area_path")
+    assert_eq "10A.3b prop area 的 mtime/ctime 未变化" "$stat_before" "$stat_after"
+else
+    log_fail "10A.3 prop area 路径解析" "existing path" "${area_path:-<empty>}"
 fi
 
 # ============================================================================
